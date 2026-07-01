@@ -56,9 +56,9 @@ func sanitize(s string) string {
 func Render(in Input) string {
 	var b strings.Builder
 
-	counts := tally(in.Results)
+	counts := Tally(in.Results)
 	total := len(in.Results)
-	failTotal := counts[verdict.FailSDKOff] + counts[verdict.FailNoButtonBlock] + counts[verdict.FailNotIncluded] + counts[verdict.FailExcluded]
+	failTotal := FailTotal(counts)
 
 	fmt.Fprintf(&b, "# Realift Button QA Report\n\n")
 	fmt.Fprintf(&b, "- **Date:** %s\n", in.GeneratedAt.Format("2006-01-02 15:04 MST"))
@@ -117,12 +117,28 @@ func Render(in Input) string {
 	return b.String()
 }
 
-func tally(results []verdict.ProductResult) map[verdict.Verdict]int {
+// Tally counts results by verdict. Exported so other presentations (the
+// terminal summary panel in internal/ui) can share the same counts as the
+// Markdown report instead of recomputing them.
+func Tally(results []verdict.ProductResult) map[verdict.Verdict]int {
 	counts := map[verdict.Verdict]int{}
 	for _, r := range results {
 		counts[r.Verdict]++
 	}
 	return counts
+}
+
+// FailTotal sums every verdict bucket that counts as a failure, per
+// Verdict.IsFail() — kept in one place so a new FAIL_* verdict can't
+// silently fall out of the headline count.
+func FailTotal(counts map[verdict.Verdict]int) int {
+	total := 0
+	for v, c := range counts {
+		if v.IsFail() {
+			total += c
+		}
+	}
+	return total
 }
 
 func filterFail(results []verdict.ProductResult) []verdict.ProductResult {

@@ -22,6 +22,7 @@ import (
 	"github.com/realift/fad-qa/internal/notify"
 	"github.com/realift/fad-qa/internal/pool"
 	"github.com/realift/fad-qa/internal/report"
+	"github.com/realift/fad-qa/internal/ui"
 	"github.com/realift/fad-qa/internal/verdict"
 )
 
@@ -123,7 +124,14 @@ func run(ctx context.Context, opts options) error {
 	limiter := fetch.NewLimiter(opts.workers, opts.rate)
 	enumerator := enumerate.New(client, limiter)
 
-	fmt.Printf("Enumerating products at %s ...\n", opts.store)
+	ui.Section("Configuration")
+	ui.KV("Store", opts.store)
+	ui.KV("App type", opts.appType)
+	ui.KV("Mode", opts.mode)
+	ui.KV("Workers", fmt.Sprintf("%d", opts.workers))
+	ui.KV("Rate", fmt.Sprintf("%.0f req/s", opts.rate))
+
+	ui.Step(1, 3, "Enumerating store")
 	enumResult, err := enumerator.Enumerate(ctx, opts.store)
 	if err != nil {
 		return fmt.Errorf("enumerate: %w", err)
@@ -137,8 +145,8 @@ func run(ctx context.Context, opts options) error {
 	if len(enumResult.Products) == 0 {
 		return writeAbortReport(opts, enumResult, now)
 	}
-
-	fmt.Printf("Discovered %d products via %s.\n", len(enumResult.Products), enumResult.Method)
+	ui.Success("Shopify store confirmed")
+	ui.Success("Discovered %d products via %s", len(enumResult.Products), enumResult.Method)
 
 	canonical := enumResult.CanonicalHost
 	if canonical == "" {
@@ -148,7 +156,7 @@ func run(ctx context.Context, opts options) error {
 	cacheStore, hadCache := cache.Load(opts.cacheDir, canonical, opts.appType)
 	mode := opts.mode
 	if mode == "quick" && !hadCache {
-		fmt.Println("No previous cache found for this store — running full instead.")
+		ui.Warn("No previous cache found for this store — running full instead.")
 		mode = "full"
 	}
 	if cacheStore == nil {
@@ -173,25 +181,48 @@ func run(ctx context.Context, opts options) error {
 				jobs = append(jobs, p)
 			}
 		}
-		fmt.Printf("Quick mode: retesting %d previously-failing/errored products.\n", len(jobs))
+		ui.Info("Quick mode: retesting %d previously-failing/errored products", len(jobs))
 		if len(newHandles) > 0 {
-			fmt.Printf("Note: %d new products since the last run were not tested (run --mode full to include them).\n", len(newHandles))
+			ui.Warn("%d new products since the last run were not tested (run --mode full to include them)", len(newHandles))
 		}
 	}
 
 	total := len(jobs)
+
+	ui.Section("Test Run")
+	ui.KV("Store", canonical)
+	ui.KV("Products", fmt.Sprintf("%d", total))
+	eta := ui.EstimateDuration(total, opts.rate)
+	ui.KV("Estimated time", fmt.Sprintf("~%s (%d products @ %.0f req/s, %d workers)", ui.FormatDuration(eta), total, opts.rate, opts.workers))
+
+	ui.Step(2, 3, "Testing products")
+
+	var bar *ui.ProductBar
+	useBar := ui.IsTTY() && !opts.verbose && total > 0
+	if useBar {
+		bar = ui.NewProductBar(total)
+	}
+
 	tested := 0
 	freshResults := pool.Run(ctx, jobs, opts.workers, func(ctx context.Context, p enumerate.Product) verdict.ProductResult {
 		return testProduct(ctx, client, limiter, opts.appType, p)
 	}, func(r verdict.ProductResult) {
 		tested++
 		cacheStore.Upsert(r.Handle, r.Title, r.URL, string(r.Verdict), r.Reason, now)
-		if opts.verbose {
-			fmt.Printf("[%d/%d] %-20s %s\n", tested, total, r.Verdict, r.Handle)
-		} else if tested%25 == 0 || tested == total {
-			fmt.Printf("Tested %d/%d...\n", tested, total)
+		switch {
+		case bar != nil:
+			bar.Add(ui.VerdictKind(r.Verdict))
+		case opts.verbose:
+			fmt.Printf("    [%d/%d] %s %s\n", tested, total, ui.VerdictLabel(r.Verdict), r.Handle)
+		case tested%25 == 0 || tested == total:
+			ui.Info("Tested %d/%d...", tested, total)
 		}
 	})
+	if bar != nil {
+		bar.Finish()
+	}
+
+	ui.Step(3, 3, "Saving results")
 
 	allResults, storeFindings := mergeResults(freshResults, enumResult.Products, cacheStore, mode)
 
@@ -208,7 +239,9 @@ func run(ctx context.Context, opts options) error {
 		cacheStore.LastFullRun = now
 	}
 	if err := cacheStore.Save(opts.cacheDir); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: could not save cache: %v\n", err)
+		ui.Warn("could not save cache: %v", err)
+	} else {
+		ui.Success("Cache saved")
 	}
 
 	reportPath, err := report.Write(opts.outDir, report.Input{
@@ -227,8 +260,10 @@ func run(ctx context.Context, opts options) error {
 	if err != nil {
 		return fmt.Errorf("write report: %w", err)
 	}
+	ui.Success("Report written to %s", reportPath)
 
-	fmt.Printf("\nReport written to %s\n", reportPath)
+	ui.PrintSummary(allResults)
+
 	notify.Done("fad-qa: run complete", fmt.Sprintf("%s (%s) — %d tested", canonical, opts.appType, total), !opts.noSound, !opts.noNotify)
 	return nil
 }
@@ -359,6 +394,7 @@ func writeAbortReport(opts options, enumResult enumerate.EnumResult, now time.Ti
 	if err != nil {
 		return fmt.Errorf("write abort report: %w", err)
 	}
-	fmt.Printf("Could not test this store: %s\nReport written to %s\n", reason, path)
+	ui.Fail("Could not test this store: %s", reason)
+	ui.Info("Report written to %s", path)
 	return nil
 }

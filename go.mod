@@ -4,7 +4,9 @@ go 1.25.0
 
 require (
 	github.com/gen2brain/beeep v0.11.2
+	github.com/schollz/progressbar/v3 v3.19.1
 	golang.org/x/net v0.56.0
+	golang.org/x/term v0.44.0
 )
 
 require (
@@ -13,7 +15,9 @@ require (
 	github.com/go-ole/go-ole v1.3.0 // indirect
 	github.com/godbus/dbus/v5 v5.1.0 // indirect
 	github.com/jackmordaunt/icns/v3 v3.0.1 // indirect
+	github.com/mitchellh/colorstring v0.0.0-20190213212951-d06e56a500db // indirect
 	github.com/nfnt/resize v0.0.0-20180221191011-83c6a9932646 // indirect
+	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/sergeymakinen/go-bmp v1.0.0 // indirect
 	github.com/sergeymakinen/go-ico v1.0.0-beta.0 // indirect
 	github.com/tadvi/systray v0.0.0-20190226123456-11a2b8fa57af // indirect
