@@ -1,0 +1,364 @@
+// Command fad-qa crawls a Shopify store's product pages over plain HTTP and
+// reports whether the Realift size-measurement button shows up correctly,
+// and if not, exactly why — no headless browser, no AI. The show/hide
+// decision is fully determined by signals rendered server-side into every
+// product page's raw HTML (see internal/verdict).
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"net/http"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/realift/fad-qa/internal/cache"
+	"github.com/realift/fad-qa/internal/enumerate"
+	"github.com/realift/fad-qa/internal/fetch"
+	"github.com/realift/fad-qa/internal/notify"
+	"github.com/realift/fad-qa/internal/pool"
+	"github.com/realift/fad-qa/internal/report"
+	"github.com/realift/fad-qa/internal/verdict"
+)
+
+const banner = "\x1b[38;5;177m" + `
+ ________   ________  ________  ________   ________
+|\  _____\ |\   __  \|\   ___ \|\   __  \ |\   __  \
+\ \  \__/  \ \  \|\  \ \  \_|\ \ \  \|\  \\ \  \|\  \
+ \ \   __\  \ \   __  \ \  \ \\ \ \  \\\  \\ \   __  \
+  \ \  \_|   \ \  \ \  \ \  \_\\ \ \  \\\  \\ \  \ \  \
+   \ \__\     \ \__\ \__\ \_______\ \_____  \\ \__\ \__\
+    \|__|      \|__|\|__|\|_______|\|___| \__\\|__|\|__|
+                                           \__\
+
+                 If Fadoua Were a Tool...
+                    It Would Be FadQA.
+                    Powered by Realift.
+` + "\x1b[0m\n"
+
+var validAppTypes = map[string]bool{
+	"realfoot": true, "realhand": true, "realbody": true, "foot3d": true,
+}
+
+type options struct {
+	store       string
+	appType     string
+	mode        string
+	workers     int
+	rate        float64
+	outDir      string
+	cacheDir    string
+	noSound     bool
+	noNotify    bool
+	noKeepAwake bool
+	verbose     bool
+}
+
+func main() {
+	opts := parseFlags()
+
+	fmt.Print(banner)
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if !opts.noKeepAwake {
+		stopAwake := notify.StartKeepAwake()
+		defer stopAwake()
+	}
+
+	if err := run(ctx, opts); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func parseFlags() options {
+	var o options
+	flag.StringVar(&o.store, "store", "", "Shopify store URL to test (required)")
+	flag.StringVar(&o.appType, "app", "", "app type: realfoot | realhand | realbody | foot3d (required)")
+	flag.StringVar(&o.mode, "mode", "full", "test mode: full | quick (quick retests only previously-failing products)")
+	flag.IntVar(&o.workers, "workers", 8, "max concurrent requests (1-32)")
+	flag.Float64Var(&o.rate, "rate", 6, "steady-state requests per second")
+	flag.StringVar(&o.outDir, "out", "./reports", "directory to write the Markdown report to")
+	flag.StringVar(&o.cacheDir, "cache", "./cache", "directory holding per-store cache files")
+	flag.BoolVar(&o.noSound, "no-sound", false, "disable completion sound")
+	flag.BoolVar(&o.noNotify, "no-notify", false, "disable desktop notification")
+	flag.BoolVar(&o.noKeepAwake, "no-keepawake", false, "don't prevent the machine from sleeping during the run")
+	flag.BoolVar(&o.verbose, "verbose", false, "print per-product progress")
+	flag.Parse()
+
+	if o.store == "" {
+		fmt.Fprintln(os.Stderr, "error: --store is required")
+		flag.Usage()
+		os.Exit(2)
+	}
+	o.appType = strings.ToLower(strings.TrimSpace(o.appType))
+	if !validAppTypes[o.appType] {
+		fmt.Fprintln(os.Stderr, "error: --app must be one of: realfoot, realhand, realbody, foot3d")
+		flag.Usage()
+		os.Exit(2)
+	}
+	o.mode = strings.ToLower(strings.TrimSpace(o.mode))
+	if o.mode != "full" && o.mode != "quick" {
+		fmt.Fprintln(os.Stderr, "error: --mode must be full or quick")
+		flag.Usage()
+		os.Exit(2)
+	}
+	if o.workers < 1 {
+		o.workers = 1
+	}
+	if o.workers > 32 {
+		o.workers = 32
+	}
+	return o
+}
+
+func run(ctx context.Context, opts options) error {
+	client := fetch.NewClient()
+	limiter := fetch.NewLimiter(opts.workers, opts.rate)
+	enumerator := enumerate.New(client, limiter)
+
+	fmt.Printf("Enumerating products at %s ...\n", opts.store)
+	enumResult, err := enumerator.Enumerate(ctx, opts.store)
+	if err != nil {
+		return fmt.Errorf("enumerate: %w", err)
+	}
+
+	now := time.Now()
+
+	if !enumResult.IsShopify || enumResult.PasswordLock {
+		return writeAbortReport(opts, enumResult, now)
+	}
+	if len(enumResult.Products) == 0 {
+		return writeAbortReport(opts, enumResult, now)
+	}
+
+	fmt.Printf("Discovered %d products via %s.\n", len(enumResult.Products), enumResult.Method)
+
+	canonical := enumResult.CanonicalHost
+	if canonical == "" {
+		canonical = opts.store
+	}
+
+	cacheStore, hadCache := cache.Load(opts.cacheDir, canonical, opts.appType)
+	mode := opts.mode
+	if mode == "quick" && !hadCache {
+		fmt.Println("No previous cache found for this store — running full instead.")
+		mode = "full"
+	}
+	if cacheStore == nil {
+		cacheStore = cache.New(canonical, opts.appType)
+	}
+
+	currentHandles := make([]string, 0, len(enumResult.Products))
+	byHandle := make(map[string]enumerate.Product, len(enumResult.Products))
+	for _, p := range enumResult.Products {
+		currentHandles = append(currentHandles, p.Handle)
+		byHandle[p.Handle] = p
+	}
+	newHandles, goneHandles := cacheStore.DetectNew(currentHandles)
+
+	var jobs []enumerate.Product
+	if mode == "full" {
+		jobs = enumResult.Products
+	} else {
+		failing := cacheStore.FailingHandles(true)
+		for _, h := range failing {
+			if p, ok := byHandle[h]; ok {
+				jobs = append(jobs, p)
+			}
+		}
+		fmt.Printf("Quick mode: retesting %d previously-failing/errored products.\n", len(jobs))
+		if len(newHandles) > 0 {
+			fmt.Printf("Note: %d new products since the last run were not tested (run --mode full to include them).\n", len(newHandles))
+		}
+	}
+
+	total := len(jobs)
+	tested := 0
+	freshResults := pool.Run(ctx, jobs, opts.workers, func(ctx context.Context, p enumerate.Product) verdict.ProductResult {
+		return testProduct(ctx, client, limiter, opts.appType, p)
+	}, func(r verdict.ProductResult) {
+		tested++
+		cacheStore.Upsert(r.Handle, r.Title, r.URL, string(r.Verdict), r.Reason, now)
+		if opts.verbose {
+			fmt.Printf("[%d/%d] %-20s %s\n", tested, total, r.Verdict, r.Handle)
+		} else if tested%25 == 0 || tested == total {
+			fmt.Printf("Tested %d/%d...\n", tested, total)
+		}
+	})
+
+	allResults, storeFindings := mergeResults(freshResults, enumResult.Products, cacheStore, mode)
+
+	if len(newHandles) > 0 {
+		storeFindings = append(storeFindings, fmt.Sprintf("%d new products discovered since the last run.", len(newHandles)))
+	}
+	if len(goneHandles) > 0 {
+		storeFindings = append(storeFindings, fmt.Sprintf("%d previously-seen products are no longer listed by the store.", len(goneHandles)))
+	}
+
+	cacheStore.EnumMethod = enumResult.Method
+	cacheStore.LastRun = now
+	if mode == "full" {
+		cacheStore.LastFullRun = now
+	}
+	if err := cacheStore.Save(opts.cacheDir); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not save cache: %v\n", err)
+	}
+
+	reportPath, err := report.Write(opts.outDir, report.Input{
+		GeneratedAt:   now,
+		StoreURL:      opts.store,
+		CanonicalHost: canonical,
+		AppType:       opts.appType,
+		Mode:          mode,
+		EnumMethod:    enumResult.Method,
+		TotalProducts: len(enumResult.Products),
+		Results:       allResults,
+		StoreFindings: storeFindings,
+		NewProducts:   len(newHandles),
+		GoneProducts:  len(goneHandles),
+	})
+	if err != nil {
+		return fmt.Errorf("write report: %w", err)
+	}
+
+	fmt.Printf("\nReport written to %s\n", reportPath)
+	notify.Done("fad-qa: run complete", fmt.Sprintf("%s (%s) — %d tested", canonical, opts.appType, total), !opts.noSound, !opts.noNotify)
+	return nil
+}
+
+// mergeResults combines this run's freshly-tested results with, in quick
+// mode, the still-valid cached verdicts for products that weren't
+// retested — so the report reflects the store's complete current state,
+// not just the narrow retest subset. It also derives store-level findings
+// that don't belong on any single product row (e.g. no include keywords
+// configured at all, or the store's keyword config changed since caching).
+func mergeResults(fresh []verdict.ProductResult, products []enumerate.Product, cacheStore *cache.StoreCache, mode string) ([]verdict.ProductResult, []string) {
+	var findings []string
+	tested := make(map[string]bool, len(fresh))
+	results := make([]verdict.ProductResult, 0, len(products))
+
+	for _, r := range fresh {
+		results = append(results, r)
+		tested[r.Handle] = true
+	}
+
+	if mode == "quick" {
+		for _, p := range products {
+			if tested[p.Handle] {
+				continue
+			}
+			st, ok := cacheStore.Products[p.Handle]
+			if !ok {
+				continue // never tested (brand new); surfaced via "new products" finding instead
+			}
+			results = append(results, verdict.ProductResult{
+				Handle: p.Handle, Title: st.Title, URL: st.URL,
+				Verdict: verdict.Verdict(st.LastVerdict), Reason: st.LastReason,
+			})
+		}
+	}
+
+	var observedInclude, observedExclude []string
+	var sawDebugContext, includeConfigured bool
+	for _, r := range fresh {
+		if r.Debug == nil {
+			continue
+		}
+		sawDebugContext = true
+		observedInclude = r.Debug.IncludeKeywordList()
+		observedExclude = r.Debug.ExcludedKeywords
+		if r.Debug.RealiftKeywordsPresent {
+			includeConfigured = true
+		}
+		break
+	}
+	if sawDebugContext && !includeConfigured {
+		findings = append(findings, "No include keywords are configured for this store's app metafield — no product will show the button via keyword matching (product/collection metafields can still resolve it directly).")
+	}
+	if sawDebugContext && cacheStore.KeywordsChanged(observedInclude, observedExclude) {
+		findings = append(findings, "The store's include/exclude keyword configuration changed since the last run.")
+	}
+	if sawDebugContext {
+		cacheStore.RealiftKeywords = observedInclude
+		cacheStore.ExcludedKeywords = observedExclude
+	}
+
+	return results, findings
+}
+
+func testProduct(ctx context.Context, client *http.Client, limiter *fetch.Limiter, appType string, p enumerate.Product) verdict.ProductResult {
+	base := verdict.ProductResult{Handle: p.Handle, Title: p.Title, URL: p.URL, ProductType: p.ProductType, AppType: appType}
+
+	result, err := fetch.GetPage(ctx, client, limiter, p.URL)
+	if err != nil {
+		base.Verdict = verdict.Errored
+		base.Reason = fmt.Sprintf("Fetch failed after retries: %v", err)
+		return base
+	}
+
+	switch {
+	case result.StatusCode == http.StatusNotFound:
+		base.Verdict = verdict.Gone
+		base.Reason = "Product page returned 404 (likely removed since enumeration)."
+		return base
+	case result.StatusCode == http.StatusUnauthorized || result.StatusCode == http.StatusForbidden:
+		base.Verdict = verdict.Errored
+		base.Reason = fmt.Sprintf("Product page returned HTTP %d (store may have become password-protected mid-run).", result.StatusCode)
+		return base
+	case result.StatusCode != http.StatusOK:
+		base.Verdict = verdict.Errored
+		base.Reason = fmt.Sprintf("Unexpected HTTP status %d.", result.StatusCode)
+		return base
+	}
+
+	extracted := verdict.Extract(result.Body)
+	if extracted.Truncated {
+		if big, bigErr := fetch.GetPageLarge(ctx, client, limiter, p.URL); bigErr == nil && big.StatusCode == http.StatusOK {
+			extracted = verdict.Extract(big.Body)
+		}
+	}
+
+	in := verdict.Input{Handle: p.Handle, Title: p.Title, URL: p.URL, ProductType: p.ProductType}
+	return verdict.Classify(in, extracted, appType)
+}
+
+func writeAbortReport(opts options, enumResult enumerate.EnumResult, now time.Time) error {
+	reason := "Unknown enumeration failure."
+	switch {
+	case !enumResult.IsShopify:
+		reason = "Domain does not appear to be a Shopify storefront."
+	case enumResult.PasswordLock:
+		reason = "Storefront is password-protected; cannot enumerate or test products."
+	case len(enumResult.Products) == 0:
+		reason = "No products discoverable via products.json, collections/all, or sitemap.xml."
+	}
+	findings := append([]string{reason}, enumResult.Warnings...)
+
+	canonical := enumResult.CanonicalHost
+	if canonical == "" {
+		canonical = opts.store
+	}
+
+	path, err := report.Write(opts.outDir, report.Input{
+		GeneratedAt:   now,
+		StoreURL:      opts.store,
+		CanonicalHost: canonical,
+		AppType:       opts.appType,
+		Mode:          opts.mode,
+		EnumMethod:    enumResult.Method,
+		TotalProducts: 0,
+		StoreFindings: findings,
+	})
+	if err != nil {
+		return fmt.Errorf("write abort report: %w", err)
+	}
+	fmt.Printf("Could not test this store: %s\nReport written to %s\n", reason, path)
+	return nil
+}
