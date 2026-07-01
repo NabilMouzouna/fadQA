@@ -192,8 +192,6 @@ func run(ctx context.Context, opts options) error {
 	ui.Section("Test Run")
 	ui.KV("Store", canonical)
 	ui.KV("Products", fmt.Sprintf("%d", total))
-	eta := ui.EstimateDuration(total, opts.rate)
-	ui.KV("Estimated time", fmt.Sprintf("~%s (%d products @ %.0f req/s, %d workers)", ui.FormatDuration(eta), total, opts.rate, opts.workers))
 
 	ui.Step(2, 3, "Testing products")
 
