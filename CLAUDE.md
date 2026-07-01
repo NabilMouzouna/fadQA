@@ -91,6 +91,13 @@ internal/cache/       Per-store-and-app-type JSON cache (atomic write) for
 internal/report/      Markdown report renderer.
 internal/notify/      Cross-platform sound/desktop notification (beeep) and
                       best-effort keep-awake (build-tag gated per OS).
+internal/ui/          Terminal presentation: color/TTY detection, phased
+                      section/step headers, a live progress bar (schollz/
+                      progressbar) with running pass/fail/skip/error tally,
+                      upfront ETA estimate, and the final summary panel.
+                      Colors and the bar auto-disable when stdout isn't a
+                      TTY or NO_COLOR is set — falls back to periodic plain
+                      "Tested N/M..." lines.
 main.go               CLI flags + orchestration.
 ```
 
@@ -98,12 +105,30 @@ main.go               CLI flags + orchestration.
 
 - Concurrency: 8 workers default (1–32 range), rate 6 req/s steady-state,
   AIMD halves both on 429/503 and grows by 1 after 20 clean successes.
-- Retry: 5 attempts, exponential backoff 500ms×2^n capped at 30s + full
-  jitter; `Retry-After` overrides when present (capped at 120s).
+- Retry has two independent budgets (`internal/fetch/get.go`,
+  `backoff.go`): network errors and 5xx get 5 attempts, exponential
+  backoff 500ms×2^n capped at 30s. **429/503 get 10 attempts, capped at
+  90s**, and *also* trip `Limiter.Cooldown()` — a hard, shared pause that
+  blocks every worker's next `Acquire`, not just the throttled request.
+  This exists because a soft AIMD halving alone isn't enough: several
+  already-in-flight workers can land on the rate limit in the same window
+  before the halving takes effect, especially on `*.shopifypreview.com`
+  dev/preview domains, which rate-limit far harder than production
+  storefronts (a real run against one saw 81/104 products fail before
+  this fix — see 2026-07-01 session log below). `Retry-After` overrides
+  the computed backoff when present (capped at 120s either way).
+- **Second-chance pass**: after the main concurrent run, `main.go`'s
+  `retryErrored` re-tests anything still `ERROR`, one at a time at 1
+  req/s with a fresh limiter — by then the store has usually cooled down.
+  Anything still failing after that is a genuine, reportable ERROR.
 - Body cap 4MB per page, one-shot retry at 16MB if a script tag looks
   truncated.
 - `/products.json` pages at 250/page (Shopify's max), hard stop at page
   400 as a runaway safety net.
+- `enumerate.normalizeBase` only defaults to `https://` when no scheme is
+  given — an explicit `http://` is respected, not force-upgraded (useful
+  for local testing against a mock store; real Shopify stores are always
+  https anyway).
 - Cache files: `cache/<host>__<apptype>.json`, schema-versioned, corrupt
   files backed up to `.bad` rather than silently discarded.
 - Quick mode always re-enumerates (cheap — a handful of JSON requests even
@@ -159,3 +184,35 @@ GOOS=windows GOARCH=arm64 go build -o fad-qa-windows-arm64.exe .
   Wrote README.md and this file, set up the git repo with `main`/`dev`
   branches and pushed to `github.com/NabilMouzouna/fadQA`, split across
   small per-package commits per the workflow rules above.
+
+- **2026-07-01 (same day, follow-up)**: Two rounds of changes based on
+  user feedback after the initial build.
+  1. Added `internal/ui` and restructured `main.go`'s terminal output into
+     phased sections (Configuration → Step 1/2/3) with a live progress
+     bar, an upfront ETA estimate, and a colored final summary panel —
+     requested because the plain scrolling log gave no sense of progress
+     or how long a run would take. Exported `report.Tally`/`FailTotal` so
+     the terminal summary and the Markdown report share one counting
+     implementation.
+  2. The user ran the tool against a real Shopify **preview/dev-store**
+     domain (`*.shopifypreview.com`) and got 81/104 products back as
+     `ERROR` (HTTP 429, retries exhausted) — preview domains rate-limit
+     much harder than production storefronts, and the original 5-attempt/
+     30s-cap retry budget plus purely-local AIMD backoff wasn't enough to
+     recover. Fixed with three changes (all in `internal/fetch`): a
+     shared `Limiter.Cooldown()` hard-pause triggered on every 429/503 so
+     *all* workers back off together (not just soft concurrency halving),
+     a separate, more patient retry budget for 429/503 specifically (10
+     attempts / 90s cap vs. 5/30s for other errors), and a `main.go`
+     `retryErrored` pass that serially re-tests anything still `ERROR`
+     after the main run at 1 req/s. Verified against a local mock Shopify
+     server simulating both a permanently-429ing product (correctly ends
+     as one `ERROR`, no hang) and a product recovering after 11 requests
+     (correctly recovered via the second-chance pass) — see
+     `internal/fetch/get_test.go` for the equivalent automated coverage.
+     Also relaxed `enumerate.normalizeBase` to stop force-upgrading an
+     explicit `http://` to `https://` (needed for local mock-store
+     testing; discovered while setting up the above verification).
+  Restructured README.md's usage section into numbered "Getting started"
+  steps plus a flags reference table, per user request for clearer
+  first-time-usage docs.
