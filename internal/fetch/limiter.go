@@ -38,6 +38,15 @@ type Limiter struct {
 	maxLimit int
 	minLimit int
 	okStreak int
+
+	// pauseUntil is a hard, shared cooldown: while set in the future, EVERY
+	// caller of Acquire blocks, not just the one that got throttled. This
+	// is what actually stops a concurrent burst from re-triggering a rate
+	// limit before the softer AIMD halving below takes effect — halving
+	// curLimit only affects requests dispatched *after* the throttle is
+	// observed, so without a shared pause, several already-in-flight
+	// workers can still land on the rate limit in the same window.
+	pauseUntil time.Time
 }
 
 // NewLimiter creates a limiter starting at maxConcurrency in-flight
@@ -62,10 +71,14 @@ func NewLimiter(maxConcurrency int, maxRatePerSec float64) *Limiter {
 	}
 }
 
-// Acquire blocks until both a concurrency slot and a rate-limit token are
-// available, or ctx is cancelled. Every successful Acquire must be paired
-// with exactly one Release.
+// Acquire blocks until any active cooldown has elapsed and both a
+// concurrency slot and a rate-limit token are available, or ctx is
+// cancelled. Every successful Acquire must be paired with exactly one
+// Release.
 func (l *Limiter) Acquire(ctx context.Context) error {
+	if err := l.acquirePause(ctx); err != nil {
+		return err
+	}
 	if err := l.acquireSlot(ctx); err != nil {
 		return err
 	}
@@ -81,6 +94,35 @@ func (l *Limiter) Release() {
 	l.mu.Lock()
 	l.inFlight--
 	l.mu.Unlock()
+}
+
+// Cooldown pauses every Acquire call — across all callers sharing this
+// limiter, not just the one reporting the throttle — until d has elapsed.
+// Calling it again during an existing cooldown only extends the pause, it
+// never shortens it.
+func (l *Limiter) Cooldown(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	l.mu.Lock()
+	if until := time.Now().Add(d); until.After(l.pauseUntil) {
+		l.pauseUntil = until
+	}
+	l.mu.Unlock()
+}
+
+func (l *Limiter) acquirePause(ctx context.Context) error {
+	for {
+		l.mu.Lock()
+		wait := time.Until(l.pauseUntil)
+		l.mu.Unlock()
+		if wait <= 0 {
+			return nil
+		}
+		if err := sleepCtx(ctx, wait); err != nil {
+			return err
+		}
+	}
 }
 
 func (l *Limiter) acquireSlot(ctx context.Context) error {

@@ -10,19 +10,30 @@ import (
 )
 
 const (
-	maxAttempts   = 5
+	// maxAttempts bounds retries for network errors and 5xx — these
+	// usually either resolve fast or indicate a genuinely broken page, so
+	// there's little value in waiting a long time.
+	maxAttempts = 5
+	maxBackoff  = 30 * time.Second
+
+	// max429Attempts and max429Backoff are more patient: a 429/503 usually
+	// just means "wait longer, then it'll work", especially on Shopify
+	// preview/dev-store domains which rate-limit far more aggressively
+	// than production storefronts. Giving up too early here is what turns
+	// a slow store into a wall of ERROR results instead of real verdicts.
+	max429Attempts = 10
+	max429Backoff  = 90 * time.Second
+
 	baseBackoff   = 500 * time.Millisecond
-	maxBackoff    = 30 * time.Second
 	maxRetryAfter = 120 * time.Second
 )
 
 // backoffDuration returns an exponential backoff with full jitter for the
-// given zero-based attempt number: ~0.5s, 1s, 2s, 4s, 8s before jitter,
-// capped at 30s.
-func backoffDuration(attempt int) time.Duration {
+// given zero-based attempt number, capped at `cap`.
+func backoffDuration(attempt int, cap time.Duration) time.Duration {
 	exp := float64(baseBackoff) * math.Pow(2, float64(attempt))
-	if exp > float64(maxBackoff) {
-		exp = float64(maxBackoff)
+	if exp > float64(cap) {
+		exp = float64(cap)
 	}
 	jittered := exp * (0.5 + rand.Float64()*0.5)
 	return time.Duration(jittered)

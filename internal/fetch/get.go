@@ -40,11 +40,21 @@ func GetPageLarge(ctx context.Context, client *http.Client, limiter *Limiter, ur
 	return getPage(ctx, client, limiter, url, largeBodyCap)
 }
 
+// getPage retries with two independent budgets: a short one for network
+// errors and 5xx (maxAttempts, capped backoff at maxBackoff — these either
+// resolve fast or the page is genuinely broken), and a much more patient
+// one for 429/503 (max429Attempts, capped backoff at max429Backoff, plus a
+// shared limiter-wide Cooldown so every other in-flight worker also backs
+// off) — some stores, especially Shopify preview/dev-store domains,
+// rate-limit hard enough that the short budget alone turns most of a run
+// into ERROR results instead of real verdicts.
 func getPage(ctx context.Context, client *http.Client, limiter *Limiter, url string, cap int64) (Result, error) {
 	var lastErr error
 	var lastStatus int
+	otherAttempts, throttleAttempts := 0, 0
 
-	for attempt := 0; attempt < maxAttempts; attempt++ {
+retryLoop:
+	for {
 		if err := limiter.Acquire(ctx); err != nil {
 			return Result{}, err
 		}
@@ -53,23 +63,33 @@ func getPage(ctx context.Context, client *http.Client, limiter *Limiter, url str
 
 		if err != nil {
 			lastErr = err
-			if waitErr := sleepCtx(ctx, backoffDuration(attempt)); waitErr != nil {
+			otherAttempts++
+			if otherAttempts >= maxAttempts {
+				break retryLoop
+			}
+			if waitErr := sleepCtx(ctx, backoffDuration(otherAttempts-1, maxBackoff)); waitErr != nil {
 				return Result{}, waitErr
 			}
 			continue
 		}
 		lastStatus = status
+		lastErr = nil
 
 		switch {
 		case status == http.StatusOK:
 			limiter.OnSuccess()
-			return Result{Body: body, StatusCode: status, Attempts: attempt + 1, Header: header, FinalURL: finalURL}, nil
+			return Result{Body: body, StatusCode: status, Attempts: otherAttempts + throttleAttempts + 1, Header: header, FinalURL: finalURL}, nil
 
 		case status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable:
-			limiter.OnThrottle()
+			throttleAttempts++
 			d := retryAfterDur
 			if d == 0 {
-				d = backoffDuration(attempt)
+				d = backoffDuration(throttleAttempts-1, max429Backoff)
+			}
+			limiter.OnThrottle()
+			limiter.Cooldown(d)
+			if throttleAttempts >= max429Attempts {
+				break retryLoop
 			}
 			if waitErr := sleepCtx(ctx, d); waitErr != nil {
 				return Result{}, waitErr
@@ -77,14 +97,18 @@ func getPage(ctx context.Context, client *http.Client, limiter *Limiter, url str
 			continue
 
 		case status >= 500:
-			if waitErr := sleepCtx(ctx, backoffDuration(attempt)); waitErr != nil {
+			otherAttempts++
+			if otherAttempts >= maxAttempts {
+				break retryLoop
+			}
+			if waitErr := sleepCtx(ctx, backoffDuration(otherAttempts-1, maxBackoff)); waitErr != nil {
 				return Result{}, waitErr
 			}
 			continue
 
 		default:
 			// 404/401/403/etc: definitive, no retry — caller decides verdict.
-			return Result{Body: body, StatusCode: status, Attempts: attempt + 1, Header: header, FinalURL: finalURL}, nil
+			return Result{Body: body, StatusCode: status, Attempts: otherAttempts + throttleAttempts + 1, Header: header, FinalURL: finalURL}, nil
 		}
 	}
 

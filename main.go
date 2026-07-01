@@ -222,6 +222,8 @@ func run(ctx context.Context, opts options) error {
 		bar.Finish()
 	}
 
+	freshResults = retryErrored(ctx, client, opts.appType, byHandle, freshResults, cacheStore, now)
+
 	ui.Step(3, 3, "Saving results")
 
 	allResults, storeFindings := mergeResults(freshResults, enumResult.Products, cacheStore, mode)
@@ -362,6 +364,54 @@ func testProduct(ctx context.Context, client *http.Client, limiter *fetch.Limite
 
 	in := verdict.Input{Handle: p.Handle, Title: p.Title, URL: p.URL, ProductType: p.ProductType}
 	return verdict.Classify(in, extracted, appType)
+}
+
+// retryErrored re-tests any product that came back ERROR from the main
+// concurrent pass, one at a time at a slow, fixed pace. Some stores —
+// Shopify preview/dev-store domains especially — rate-limit hard enough
+// that a batch of concurrent requests trips a 429 storm before the
+// adaptive limiter can react; by the time the main pass finishes, the
+// store has usually had time to cool down, so a patient serial retry
+// recovers most of what would otherwise be reported as untested.
+func retryErrored(ctx context.Context, client *http.Client, appType string, byHandle map[string]enumerate.Product, results []verdict.ProductResult, cacheStore *cache.StoreCache, now time.Time) []verdict.ProductResult {
+	var toRetry []enumerate.Product
+	for _, r := range results {
+		if r.Verdict == verdict.Errored {
+			if p, ok := byHandle[r.Handle]; ok {
+				toRetry = append(toRetry, p)
+			}
+		}
+	}
+	if len(toRetry) == 0 {
+		return results
+	}
+
+	ui.Warn("%d products were not reachable (likely rate-limited) — retrying slowly, one at a time", len(toRetry))
+	if len(toRetry) > 200 {
+		ui.Info("This may take a while; press Ctrl+C to stop early and keep whatever was recovered so far")
+	}
+
+	retryLimiter := fetch.NewLimiter(1, 1)
+	recovered := 0
+	retried := pool.Run(ctx, toRetry, 1, func(ctx context.Context, p enumerate.Product) verdict.ProductResult {
+		return testProduct(ctx, client, retryLimiter, appType, p)
+	}, nil)
+
+	updated := make(map[string]verdict.ProductResult, len(retried))
+	for _, r := range retried {
+		updated[r.Handle] = r
+		cacheStore.Upsert(r.Handle, r.Title, r.URL, string(r.Verdict), r.Reason, now)
+		if r.Verdict != verdict.Errored {
+			recovered++
+		}
+	}
+	for i, r := range results {
+		if u, ok := updated[r.Handle]; ok {
+			results[i] = u
+		}
+	}
+	ui.Success("Recovered %d/%d previously-unreachable products on retry", recovered, len(toRetry))
+	return results
 }
 
 func writeAbortReport(opts options, enumResult enumerate.EnumResult, now time.Time) error {

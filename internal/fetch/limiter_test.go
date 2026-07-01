@@ -100,17 +100,49 @@ func TestLimiter_AcquireRespectsContextCancellation(t *testing.T) {
 	}
 }
 
+func TestLimiter_CooldownBlocksAllAcquires(t *testing.T) {
+	l := NewLimiter(8, 1000) // plenty of slots/tokens — only the cooldown should gate us
+	l.Cooldown(80 * time.Millisecond)
+
+	start := time.Now()
+	if err := l.Acquire(context.Background()); err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	elapsed := time.Since(start)
+	if elapsed < 70*time.Millisecond {
+		t.Fatalf("expected Acquire to block for the cooldown, only waited %v", elapsed)
+	}
+}
+
+func TestLimiter_CooldownExtendsButNeverShortens(t *testing.T) {
+	l := NewLimiter(1, 1000)
+	l.Cooldown(200 * time.Millisecond)
+	l.Cooldown(50 * time.Millisecond) // shorter — must not shrink the existing pause
+
+	start := time.Now()
+	if err := l.Acquire(context.Background()); err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	if time.Since(start) < 150*time.Millisecond {
+		t.Fatalf("a shorter Cooldown call shortened the existing pause")
+	}
+}
+
 func TestBackoffDuration_MonotonicAndCapped(t *testing.T) {
-	prevMax := time.Duration(0)
 	for attempt := 0; attempt < 10; attempt++ {
-		d := backoffDuration(attempt)
+		d := backoffDuration(attempt, maxBackoff)
 		if d <= 0 {
 			t.Fatalf("attempt %d: expected positive duration, got %v", attempt, d)
 		}
 		if d > maxBackoff {
 			t.Fatalf("attempt %d: exceeded cap: %v", attempt, d)
 		}
-		_ = prevMax
+	}
+	for attempt := 0; attempt < 10; attempt++ {
+		d := backoffDuration(attempt, max429Backoff)
+		if d > max429Backoff {
+			t.Fatalf("attempt %d: exceeded 429 cap: %v", attempt, d)
+		}
 	}
 }
 
