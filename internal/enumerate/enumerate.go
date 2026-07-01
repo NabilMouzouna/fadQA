@@ -75,8 +75,11 @@ func (e *Enumerator) Enumerate(ctx context.Context, rawStoreURL string) (EnumRes
 	return res, nil
 }
 
-// normalizeBase forces https, strips path/query/fragment, and validates the
-// input has a usable host.
+// normalizeBase defaults to https when no scheme is given, strips
+// path/query/fragment, and validates the input has a usable host. An
+// explicit http:// is left as-is rather than force-upgraded — real Shopify
+// stores are always https, but there's no reason to override a caller who
+// deliberately points at a plain-http endpoint (e.g. local testing).
 func normalizeBase(raw string) (string, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -92,7 +95,9 @@ func normalizeBase(raw string) (string, error) {
 	if u.Host == "" {
 		return "", fmt.Errorf("invalid store URL %q: missing host", raw)
 	}
-	u.Scheme = "https"
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", fmt.Errorf("invalid store URL %q: unsupported scheme %q", raw, u.Scheme)
+	}
 	u.Path = ""
 	u.RawQuery = ""
 	u.Fragment = ""

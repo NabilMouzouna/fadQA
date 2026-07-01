@@ -33,7 +33,7 @@ func TestNormalizeTags(t *testing.T) {
 func TestNormalizeBase(t *testing.T) {
 	cases := map[string]string{
 		"example.myshopify.com":             "https://example.myshopify.com",
-		"http://example.com/":               "https://example.com",
+		"http://example.com/":               "http://example.com",
 		"https://example.com/some/path?x=1": "https://example.com",
 	}
 	for input, want := range cases {
@@ -47,6 +47,9 @@ func TestNormalizeBase(t *testing.T) {
 	}
 	if _, err := normalizeBase(""); err == nil {
 		t.Fatalf("expected error for empty input")
+	}
+	if _, err := normalizeBase("ftp://example.com"); err == nil {
+		t.Fatalf("expected error for unsupported scheme")
 	}
 }
 
