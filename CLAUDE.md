@@ -92,12 +92,16 @@ internal/report/      Markdown report renderer.
 internal/notify/      Cross-platform sound/desktop notification (beeep) and
                       best-effort keep-awake (build-tag gated per OS).
 internal/ui/          Terminal presentation: color/TTY detection, phased
-                      section/step headers, a live progress bar (schollz/
-                      progressbar) with running pass/fail/skip/error tally,
-                      upfront ETA estimate, and the final summary panel.
-                      Colors and the bar auto-disable when stdout isn't a
-                      TTY or NO_COLOR is set — falls back to periodic plain
-                      "Tested N/M..." lines.
+                      section/step headers, a two-line live progress bar
+                      (schollz/progressbar on top, a spaced-out pass/fail/
+                      skip/error tally below it, redrawn via raw ANSI
+                      cursor movement), and the final summary panel. Shows
+                      elapsed time, not a predicted ETA — rate limiting can
+                      make throughput collapse mid-run, so a naive linear
+                      ETA would be actively misleading rather than just
+                      imprecise. Colors and the bar auto-disable when
+                      stdout isn't a TTY or NO_COLOR is set — falls back to
+                      periodic plain "Tested N/M..." lines.
 main.go               CLI flags + orchestration.
 ```
 
@@ -189,10 +193,11 @@ GOOS=windows GOARCH=arm64 go build -o fad-qa-windows-arm64.exe .
   user feedback after the initial build.
   1. Added `internal/ui` and restructured `main.go`'s terminal output into
      phased sections (Configuration → Step 1/2/3) with a live progress
-     bar, an upfront ETA estimate, and a colored final summary panel —
-     requested because the plain scrolling log gave no sense of progress
-     or how long a run would take. Exported `report.Tally`/`FailTotal` so
-     the terminal summary and the Markdown report share one counting
+     bar, an upfront ETA estimate (later removed — see below), and a
+     colored final summary panel — requested because the plain scrolling
+     log gave no sense of progress or how long a run would take. Exported
+     `report.Tally`/`FailTotal` so the terminal summary and the Markdown
+     report share one counting
      implementation.
   2. The user ran the tool against a real Shopify **preview/dev-store**
      domain (`*.shopifypreview.com`) and got 81/104 products back as
@@ -216,3 +221,24 @@ GOOS=windows GOARCH=arm64 go build -o fad-qa-windows-arm64.exe .
   Restructured README.md's usage section into numbered "Getting started"
   steps plus a flags reference table, per user request for clearer
   first-time-usage docs.
+
+- **2026-07-01 (same day, second follow-up)**: Ran the tool again against
+  the same `*.shopifypreview.com` store from the fix above. The run
+  legitimately took much longer than the bar's own live ETA predicted
+  (stuck at 23% for ~1 minute against a "[2s:9s]" estimate) — the store
+  was rate-limiting again and the retry/cooldown machinery was correctly
+  being patient, but schollz/progressbar's linear ETA extrapolation has no
+  visibility into that and just extrapolates pre-throttle throughput,
+  producing a confidently wrong number. Combined with feedback that the
+  upfront static estimate (`ui.EstimateDuration`) was similarly untrustworthy,
+  removed both: deleted `internal/ui/eta.go` entirely, dropped the "Test
+  Run" section's "Estimated time" line in `main.go`, and switched
+  `ProductBar` to `OptionSetElapsedTime(true)` / `OptionSetPredictTime(false)`
+  — elapsed time is always true, a predicted remaining time under this
+  workload usually isn't. Also restructured `ProductBar` into two live
+  lines per user request (bar on top, wider-spaced pass/fail/skip/error
+  tally below, instead of cramming the tally into the bar's own
+  description prefix) using raw ANSI cursor-up/clear-line escapes to
+  redraw both in place — see `internal/ui/progress.go`. Not unit-tested
+  (terminal escape-sequence output isn't meaningfully testable); verify
+  visually in a real terminal if this rendering is touched again.

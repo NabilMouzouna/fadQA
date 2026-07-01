@@ -53,9 +53,9 @@ GOOS=darwin  GOARCH=arm64 go build -o fad-qa-darwin-arm64 .
 ```
 
 This enumerates every product the store publishes, tests each product
-page, and prints a live progress bar with an upfront time estimate. First
-runs on a large catalog can take a while — the estimate at the top of
-"Test Run" tells you roughly how long before you start.
+page, and prints a live progress bar with a running pass/fail/skip/error
+tally underneath. First runs on a large catalog can take a while,
+especially if the store rate-limits — see the note on that below.
 
 ### 3. Read the report
 
