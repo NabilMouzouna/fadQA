@@ -1,0 +1,6 @@
+/cache/*.json
+/cache/*.json.bad
+/reports/*.md
+/fad-qa
+/fad-qa.exe
+/dist/
