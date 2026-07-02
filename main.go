@@ -108,8 +108,8 @@ func parseFlags() options {
 	flag.StringVar(&o.store, "store", "", "Shopify store URL to test (required)")
 	flag.StringVar(&o.appType, "app", "", "app type: realfoot | realhand | realbody | foot3d (required)")
 	flag.StringVar(&o.mode, "mode", "full", "test mode: full | quick (quick retests only previously-failing products)")
-	flag.IntVar(&o.workers, "workers", 8, "max concurrent requests (1-32)")
-	flag.Float64Var(&o.rate, "rate", 6, "steady-state requests per second")
+	flag.IntVar(&o.workers, "workers", 4, "max concurrent requests, 1-32 (the adaptive limiter starts lower and ramps up to this ceiling)")
+	flag.Float64Var(&o.rate, "rate", 4, "max steady-state requests per second (ramped up to, not started at)")
 	flag.StringVar(&o.outDir, "out", defaultOut, "directory to write the Markdown report to (default: next to the executable)")
 	flag.StringVar(&o.cacheDir, "cache", defaultCache, "directory holding per-store cache files (default: next to the executable)")
 	flag.BoolVar(&o.noSound, "no-sound", false, "disable completion sound")
@@ -149,12 +149,26 @@ func run(ctx context.Context, opts options) error {
 	limiter := fetch.NewLimiter(opts.workers, opts.rate)
 	enumerator := enumerate.New(client, limiter)
 
+	// bar is created later (only for the testing phase on a TTY). The cooldown
+	// hook captures it by reference so a Cloudflare pause is surfaced cleanly
+	// whether it happens during enumeration (bar still nil → plain warn) or
+	// mid-progress-bar (bar set → Note clears and reprints around it).
+	var bar *ui.ProductBar
+	limiter.SetCooldownHook(func(d time.Duration, episode int) {
+		msg := fmt.Sprintf("Store is rate-limiting us (Cloudflare bot protection) — pausing %s to let it clear [cooldown #%d], then resuming slower.", ui.FormatDuration(d), episode)
+		if bar != nil {
+			bar.Note("    " + ui.Yellow("[waiting] ") + msg)
+		} else {
+			ui.Warn("%s", msg)
+		}
+	})
+
 	ui.Section("Configuration")
 	ui.KV("Store", opts.store)
 	ui.KV("App type", opts.appType)
 	ui.KV("Mode", opts.mode)
-	ui.KV("Workers", fmt.Sprintf("%d", opts.workers))
-	ui.KV("Rate", fmt.Sprintf("%.0f req/s", opts.rate))
+	ui.KV("Max workers", fmt.Sprintf("%d", opts.workers))
+	ui.KV("Max rate", fmt.Sprintf("%.0f req/s", opts.rate))
 
 	ui.Step(1, 3, "Enumerating store")
 	enumResult, err := enumerator.Enumerate(ctx, opts.store)
@@ -220,9 +234,7 @@ func run(ctx context.Context, opts options) error {
 
 	ui.Step(2, 3, "Testing products")
 
-	var bar *ui.ProductBar
-	useBar := ui.IsTTY() && !opts.verbose && total > 0
-	if useBar {
+	if ui.IsTTY() && !opts.verbose && total > 0 {
 		bar = ui.NewProductBar(total)
 	}
 
@@ -245,11 +257,17 @@ func run(ctx context.Context, opts options) error {
 		bar.Finish()
 	}
 
-	freshResults = retryErrored(ctx, client, opts.appType, byHandle, freshResults, cacheStore, now)
+	freshResults = retryErrored(ctx, client, limiter, opts.appType, byHandle, freshResults, cacheStore, now)
 
 	ui.Step(3, 3, "Saving results")
 
 	allResults, storeFindings := mergeResults(freshResults, enumResult.Products, cacheStore, mode)
+
+	if limiter.GivenUp() {
+		storeFindings = append(storeFindings, "The store's Cloudflare bot protection persistently blocked automated access, so some products could not be tested. This is not a fault in the store's Realift setup. Try again later, from a different network/IP, or with a lower --rate.")
+	} else if n := limiter.TotalChallenges(); n > 0 {
+		storeFindings = append(storeFindings, fmt.Sprintf("The store rate-limited us %d time(s) during the run (Cloudflare); the crawl paced itself down to get through. Re-running in --mode quick will re-check anything left as ERROR.", n))
+	}
 
 	if len(newHandles) > 0 {
 		storeFindings = append(storeFindings, fmt.Sprintf("%d new products discovered since the last run.", len(newHandles)))
@@ -378,6 +396,15 @@ func testProduct(ctx context.Context, client *http.Client, limiter *fetch.Limite
 		return base
 	}
 
+	// Defensive: a 200 whose body is actually a Cloudflare challenge (rare,
+	// depends on CF config) must not be read as "SDK disabled" just because
+	// the realift tags are absent.
+	if fetch.IsChallengeBody(result.Body) {
+		base.Verdict = verdict.Errored
+		base.Reason = "Page returned a Cloudflare bot-challenge instead of the product page."
+		return base
+	}
+
 	extracted := verdict.Extract(result.Body)
 	if extracted.Truncated {
 		if big, bigErr := fetch.GetPageLarge(ctx, client, limiter, p.URL); bigErr == nil && big.StatusCode == http.StatusOK {
@@ -390,13 +417,14 @@ func testProduct(ctx context.Context, client *http.Client, limiter *fetch.Limite
 }
 
 // retryErrored re-tests any product that came back ERROR from the main
-// concurrent pass, one at a time at a slow, fixed pace. Some stores —
-// Shopify preview/dev-store domains especially — rate-limit hard enough
-// that a batch of concurrent requests trips a 429 storm before the
-// adaptive limiter can react; by the time the main pass finishes, the
-// store has usually had time to cool down, so a patient serial retry
-// recovers most of what would otherwise be reported as untested.
-func retryErrored(ctx context.Context, client *http.Client, appType string, byHandle map[string]enumerate.Product, results []verdict.ProductResult, cacheStore *cache.StoreCache, now time.Time) []verdict.ProductResult {
+// concurrent pass, one at a time at the slowest safe pace. By the time the
+// main pass finishes a transiently rate-limited store has usually cooled
+// down, so a patient serial retry recovers most of what would otherwise be
+// reported as untested. It is skipped entirely when the store has proven it
+// is persistently blocking us (retrying would just re-block and waste
+// minutes), and it gives the per-IP reputation score a head-start to decay
+// if the main run hit any Cloudflare challenges.
+func retryErrored(ctx context.Context, client *http.Client, mainLimiter *fetch.Limiter, appType string, byHandle map[string]enumerate.Product, results []verdict.ProductResult, cacheStore *cache.StoreCache, now time.Time) []verdict.ProductResult {
 	var toRetry []enumerate.Product
 	for _, r := range results {
 		if r.Verdict == verdict.Errored {
@@ -409,12 +437,26 @@ func retryErrored(ctx context.Context, client *http.Client, appType string, byHa
 		return results
 	}
 
-	ui.Warn("%d products were not reachable (likely rate-limited) — retrying slowly, one at a time", len(toRetry))
-	if len(toRetry) > 200 {
-		ui.Info("This may take a while; press Ctrl+C to stop early and keep whatever was recovered so far")
+	if mainLimiter.GivenUp() {
+		ui.Warn("%d products could not be tested and the store is still blocking automated access — skipping retry (it would only re-block).", len(toRetry))
+		return results
 	}
 
-	retryLimiter := fetch.NewLimiter(1, 1)
+	ui.Warn("%d products were not reachable — retrying slowly, one at a time", len(toRetry))
+
+	// If the main run tripped Cloudflare, wait for the per-IP score to decay
+	// before hammering again, otherwise the retry pass just re-trips it.
+	if mainLimiter.TotalChallenges() > 0 {
+		const settle = 60 * time.Second
+		ui.Info("Letting the store's rate limit settle for %s first...", ui.FormatDuration(settle))
+		select {
+		case <-time.After(settle):
+		case <-ctx.Done():
+			return results
+		}
+	}
+
+	retryLimiter := fetch.NewLimiter(1, 1) // concurrency 1, fresh give-up budget
 	recovered := 0
 	retried := pool.Run(ctx, toRetry, 1, func(ctx context.Context, p enumerate.Product) verdict.ProductResult {
 		return testProduct(ctx, client, retryLimiter, appType, p)
