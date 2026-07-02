@@ -102,6 +102,31 @@ a large catalog) to catch new or removed products, but only re-fetches
 product pages for items that previously failed or errored. Nothing extra
 to configure — the cache is keyed automatically by store and app type.
 
+## Slack reporting (optional)
+
+When a run finishes, the tool always writes the Markdown report and shows a
+desktop notification + sound. It can **also** post a summary to Slack.
+
+To enable it, drop a `.env` file **next to the binary** (same folder) with
+your Slack Incoming Webhook:
+
+```
+SLACK-WEBHOOK-TOKEN=https://hooks.slack.com/services/<workspace-id>/<channel-id>/<secret>
+SLACK-CHANNEL=#realift-qa
+```
+
+- `SLACK-WEBHOOK-TOKEN` — your Incoming Webhook. The full `https://...` URL
+  or just the trailing path token both work.
+- `SLACK-CHANNEL` — informational only (an Incoming Webhook always posts to
+  the channel it was created for).
+
+If `.env` is absent (or has no webhook), Slack posting is silently skipped —
+so the same binary works with or without it. The `.env` is **never committed
+to git** (it's gitignored) and must be distributed to teammates separately
+from the public binary. Every completed run posts a summary: status counts,
+store name + URL, app type, date, mode, product count, and the top failing
+products.
+
 ## Building and distributing (for whoever maintains this tool)
 
 ### Prerequisites

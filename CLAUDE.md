@@ -98,7 +98,16 @@ internal/cache/       Per-store-and-app-type JSON cache (atomic write) for
                       full-vs-quick reruns.
 internal/report/      Markdown report renderer.
 internal/notify/      Cross-platform sound/desktop notification (beeep) and
-                      best-effort keep-awake (build-tag gated per OS).
+                      best-effort keep-awake (build-tag gated per OS). The
+                      completion notification body now carries pass/fail/
+                      skip/error counts.
+internal/slack/       Optional Slack Incoming Webhook reporting. Reads .env
+                      (dotenv.go; keys SLACK-WEBHOOK-TOKEN / SLACK-CHANNEL)
+                      from next to the binary (main.go falls back to cwd),
+                      builds a Block Kit summary (payload.go, JSON-marshalled
+                      so user text is escaped), POSTs on every completed run.
+                      Absent .env → silently skipped; delivery failure →
+                      warning, never fatal.
 internal/ui/          Terminal presentation: color/TTY detection, phased
                       section/step headers, a two-line live progress bar
                       (schollz/progressbar on top, a spaced-out pass/fail/
@@ -386,3 +395,20 @@ GOOS=windows GOARCH=arm64 go build -o fad-qa-windows-arm64.exe .
   and recovery against the real store (the IP was still flagged from probing,
   so it correctly paused 60s during enumeration then recovered). Unit tests
   cover the limiter escalation/give-up/coalescing and challenge detection.
+
+- **2026-07-02 (Slack reporting + notification enrichment)**: Added
+  `internal/slack` — posts a Block Kit summary to a Slack Incoming Webhook on
+  every completed run (including abort/blocked runs). Config comes from a
+  `.env` next to the binary (keys `SLACK-WEBHOOK-TOKEN`, `SLACK-CHANNEL`,
+  matching the user's file; `webhookURL` accepts a full URL or bare token);
+  absent `.env` → silently skipped, delivery failure → warning not fatal.
+  `.env` is gitignored (verified never committed to history); `.env.example`
+  documents the format. Added best-effort store-name extraction in
+  `enumerate.detect` (og:site_name → `<title>` first segment → host
+  heuristic; `shopname.go`) surfaced as `EnumResult.ShopName` and used in the
+  Slack/desktop summaries. Enriched `notify.Done` body with pass/fail/skip/
+  error counts. Unit-tested dotenv parsing, webhook URL normalization,
+  payload build/escaping/failure-capping, POST success+non-2xx, and shop-name
+  extraction. NOTE: not yet verified against the real webhook (would post a
+  live message to the team channel) — the pipeline is proven against an
+  httptest server; offer a one-off test post before relying on it.
