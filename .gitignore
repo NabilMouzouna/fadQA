@@ -1,7 +1,10 @@
 /cache/*.json
 /cache/*.json.bad
 /reports/*.md
-/fad-qa
-/fad-qa.exe
+# built binaries, anywhere (incl. local scratch run-dirs next to a copied binary)
+fad-qa
+fad-qa.exe
 /dist/
 *.code-workspace
+.env
+
