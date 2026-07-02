@@ -25,18 +25,39 @@ executing any JavaScript. See `CLAUDE.md` for the full technical writeup.
 
 ## Getting started (for teammates — no Go, no repo checkout)
 
-If someone already built and shared `fad-qa` with you as a zip, this is
-all you need:
+### macOS
 
-1. Unzip it and open a terminal in that folder.
-2. **macOS**: the binary isn't signed, so the first launch needs one extra
-   step — right-click `fad-qa` → **Open** → confirm "Open" in the dialog.
-   (Or run `xattr -d com.apple.quarantine ./fad-qa` once in Terminal.)
-   After that first approval, it runs normally from the terminal.
-3. **Windows**: SmartScreen will likely say "Windows protected your PC" —
-   click **More info** → **Run anyway**. This only happens once per
-   machine.
-4. Run it — see "Usage" below.
+```
+curl -fsSL https://raw.githubusercontent.com/NabilMouzouna/fadQA/main/install.sh | bash
+```
+
+Downloads the latest release for your Mac (Intel or Apple Silicon,
+detected automatically) and drops `./fad-qa` in the current directory.
+Then run it — see "Usage" below.
+
+### Windows
+
+```
+curl.exe -L -o fad-qa.zip https://github.com/NabilMouzouna/fadQA/releases/latest/download/fad-qa-windows-amd64.zip
+tar -xf fad-qa.zip
+```
+
+(Use `fad-qa-windows-arm64.zip` instead if you're on Windows on ARM.)
+This extracts a `fad-qa-windows-amd64` folder containing `fad-qa.exe`. The
+first time you run it, SmartScreen will likely say "Windows protected
+your PC" — click **More info** → **Run anyway**. This only happens once
+per machine. Then run it — see "Usage" below.
+
+### Manual download (either platform)
+
+Grab the zip for your platform from the [latest
+release](https://github.com/NabilMouzouna/fadQA/releases/latest) and
+unzip it yourself instead of using the commands above:
+
+- **macOS**: the binary isn't signed, so the first launch needs one extra
+  step — right-click `fad-qa` → **Open** → confirm "Open" in the dialog.
+  (Or run `xattr -d com.apple.quarantine ./fad-qa` once in Terminal.)
+- **Windows**: same SmartScreen click-through as above.
 
 `cache/` and `reports/` folders are created automatically right next to
 the binary the first time they're needed, wherever that binary happens to
@@ -111,6 +132,21 @@ To build a single platform manually instead:
 GOOS=windows GOARCH=amd64 go build -o fad-qa-windows-amd64.exe .
 GOOS=darwin  GOARCH=arm64 go build -o fad-qa-darwin-arm64 .
 ```
+
+### Publishing a new release
+
+The curl install commands above always pull the **latest** GitHub
+Release, so cutting a new one is what ships an update to the team:
+
+```
+./build.sh
+git tag -a vX.Y.Z -m "vX.Y.Z"
+git push origin vX.Y.Z
+```
+
+Then create a release for that tag on GitHub and upload the four zips
+from `dist/` as its assets (via the GitHub web UI, or `gh release create
+vX.Y.Z dist/*.zip` if you have the GitHub CLI installed).
 
 ## Flags reference
 
