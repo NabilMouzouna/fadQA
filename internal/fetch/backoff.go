@@ -9,24 +9,8 @@ import (
 	"time"
 )
 
-const (
-	// maxAttempts bounds retries for network errors and 5xx — these
-	// usually either resolve fast or indicate a genuinely broken page, so
-	// there's little value in waiting a long time.
-	maxAttempts = 5
-	maxBackoff  = 30 * time.Second
-
-	// max429Attempts and max429Backoff are more patient: a 429/503 usually
-	// just means "wait longer, then it'll work", especially on Shopify
-	// preview/dev-store domains which rate-limit far more aggressively
-	// than production storefronts. Giving up too early here is what turns
-	// a slow store into a wall of ERROR results instead of real verdicts.
-	max429Attempts = 10
-	max429Backoff  = 90 * time.Second
-
-	baseBackoff   = 500 * time.Millisecond
-	maxRetryAfter = 120 * time.Second
-)
+// Retry/backoff tuning constants live in get.go alongside the retry loop
+// that consumes them (maxAttempts, maxBackoff, baseBackoff, maxRetryAfter).
 
 // backoffDuration returns an exponential backoff with full jitter for the
 // given zero-based attempt number, capped at `cap`.

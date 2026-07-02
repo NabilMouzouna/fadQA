@@ -2,54 +2,108 @@ package fetch
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"testing"
 	"time"
 )
 
-func TestLimiter_AIMD_ThrottleThenRecover(t *testing.T) {
+func TestLimiter_StartsLowAndRampsUp(t *testing.T) {
 	l := NewLimiter(8, 100)
 
 	curLimit, rate := l.Snapshot()
-	if curLimit != 8 || rate != 100 {
-		t.Fatalf("expected initial state (8, 100), got (%d, %v)", curLimit, rate)
+	if curLimit != 2 || rate != 2 {
+		t.Fatalf("expected slow start (2, 2), got (%d, %v)", curLimit, rate)
 	}
 
-	l.OnThrottle()
-	curLimit, rate = l.Snapshot()
-	if curLimit != 4 {
-		t.Fatalf("expected concurrency halved to 4 after throttle, got %d", curLimit)
-	}
-	if rate != 50 {
-		t.Fatalf("expected rate halved to 50 after throttle, got %v", rate)
-	}
-
-	for i := 0; i < recoveryStreak; i++ {
+	for i := 0; i < rampStreak; i++ {
 		l.OnSuccess()
 	}
 	curLimit, rate = l.Snapshot()
-	if curLimit != 5 {
-		t.Fatalf("expected concurrency to grow by 1 to 5 after recovery streak, got %d", curLimit)
-	}
-	if rate != 51 {
-		t.Fatalf("expected rate to grow by 1 to 51 after recovery streak, got %v", rate)
+	if curLimit != 3 || rate != 3 {
+		t.Fatalf("expected ramp to (3, 3) after a clean streak, got (%d, %v)", curLimit, rate)
 	}
 }
 
-func TestLimiter_NeverExceedsMaxOrFloor(t *testing.T) {
-	l := NewLimiter(1, 1)
-	l.OnThrottle() // already at floor
-	curLimit, rate := l.Snapshot()
-	if curLimit != 1 || rate != 1 {
-		t.Fatalf("expected floor (1,1), got (%d, %v)", curLimit, rate)
-	}
-
-	for i := 0; i < recoveryStreak*5; i++ {
+func TestLimiter_ThrottleHalves(t *testing.T) {
+	l := NewLimiter(8, 100)
+	// ramp up a few steps first so halving is observable
+	for i := 0; i < rampStreak*3; i++ {
 		l.OnSuccess()
 	}
-	curLimit, rate = l.Snapshot()
-	if curLimit != 1 || rate != 1 {
-		t.Fatalf("expected to stay at ceiling (1,1) since max==min, got (%d, %v)", curLimit, rate)
+	before, _ := l.Snapshot()
+	l.OnThrottle()
+	after, _ := l.Snapshot()
+	if after > before/2+1 || after < 1 {
+		t.Fatalf("expected concurrency roughly halved from %d, got %d", before, after)
+	}
+}
+
+func TestLimiter_OnChallengeDropsToFloorAndEscalates(t *testing.T) {
+	l := NewLimiter(8, 100)
+	for i := 0; i < rampStreak*3; i++ {
+		l.OnSuccess()
+	}
+
+	forceFreshEpisode := func() {
+		l.mu.Lock()
+		l.pauseUntil = time.Time{}
+		l.mu.Unlock()
+	}
+
+	// maxChallengeStreak fresh episodes are tolerated (return true)...
+	for i := 1; i <= maxChallengeStreak; i++ {
+		forceFreshEpisode()
+		if !l.OnChallenge() {
+			t.Fatalf("episode %d: expected to keep going", i)
+		}
+	}
+	cur, rate := l.Snapshot()
+	if cur != 1 || rate != 1 {
+		t.Fatalf("expected drop to floor (1,1) on challenge, got (%d,%v)", cur, rate)
+	}
+
+	// ...one more distinct episode crosses the cap → give up.
+	forceFreshEpisode()
+	if l.OnChallenge() {
+		t.Fatalf("expected give-up after exceeding the challenge streak")
+	}
+	if err := l.Acquire(context.Background()); !errors.Is(err, ErrBlocked) {
+		t.Fatalf("expected Acquire to return ErrBlocked once given up, got %v", err)
+	}
+}
+
+func TestLimiter_ChallengeCoalescesSimultaneousDetections(t *testing.T) {
+	l := NewLimiter(8, 100)
+	l.mu.Lock()
+	l.baseCooldown = time.Hour // long, so the episode stays "active"
+	l.mu.Unlock()
+
+	if !l.OnChallenge() {
+		t.Fatalf("first challenge should keep going")
+	}
+	// Two more workers detecting the SAME episode (pause still active) must not
+	// escalate the streak — they coalesce into the one episode.
+	l.OnChallenge()
+	l.OnChallenge()
+	if got := l.TotalChallenges(); got != 1 {
+		t.Fatalf("expected simultaneous detections to coalesce into 1 episode, got %d", got)
+	}
+}
+
+func TestLimiter_SuccessClearsChallengeStreak(t *testing.T) {
+	l := NewLimiter(8, 100)
+	l.mu.Lock()
+	l.baseCooldown = time.Millisecond
+	l.mu.Unlock()
+
+	l.OnChallenge()
+	l.OnSuccess() // recovery
+	l.mu.Lock()
+	streak := l.challengeStreak
+	l.mu.Unlock()
+	if streak != 0 {
+		t.Fatalf("expected a success to clear the challenge streak, got %d", streak)
 	}
 }
 
@@ -69,13 +123,11 @@ func TestLimiter_AcquireRespectsConcurrencyCap(t *testing.T) {
 		_ = l.Acquire(ctx)
 		close(acquired)
 	}()
-
 	select {
 	case <-acquired:
 		t.Fatalf("third acquire should have blocked while 2 slots are held")
 	case <-time.After(50 * time.Millisecond):
 	}
-
 	l.Release()
 	select {
 	case <-acquired:
@@ -88,11 +140,9 @@ func TestLimiter_AcquireRespectsConcurrencyCap(t *testing.T) {
 
 func TestLimiter_AcquireRespectsContextCancellation(t *testing.T) {
 	l := NewLimiter(1, 1000)
-	ctx := context.Background()
-	if err := l.Acquire(ctx); err != nil {
+	if err := l.Acquire(context.Background()); err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
-
 	cancelCtx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if err := l.Acquire(cancelCtx); err == nil {
@@ -101,24 +151,21 @@ func TestLimiter_AcquireRespectsContextCancellation(t *testing.T) {
 }
 
 func TestLimiter_CooldownBlocksAllAcquires(t *testing.T) {
-	l := NewLimiter(8, 1000) // plenty of slots/tokens — only the cooldown should gate us
+	l := NewLimiter(8, 1000)
 	l.Cooldown(80 * time.Millisecond)
-
 	start := time.Now()
 	if err := l.Acquire(context.Background()); err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
-	elapsed := time.Since(start)
-	if elapsed < 70*time.Millisecond {
-		t.Fatalf("expected Acquire to block for the cooldown, only waited %v", elapsed)
+	if time.Since(start) < 70*time.Millisecond {
+		t.Fatalf("expected Acquire to block for the cooldown")
 	}
 }
 
 func TestLimiter_CooldownExtendsButNeverShortens(t *testing.T) {
 	l := NewLimiter(1, 1000)
 	l.Cooldown(200 * time.Millisecond)
-	l.Cooldown(50 * time.Millisecond) // shorter — must not shrink the existing pause
-
+	l.Cooldown(50 * time.Millisecond)
 	start := time.Now()
 	if err := l.Acquire(context.Background()); err != nil {
 		t.Fatalf("acquire: %v", err)
@@ -129,7 +176,7 @@ func TestLimiter_CooldownExtendsButNeverShortens(t *testing.T) {
 }
 
 func TestBackoffDuration_MonotonicAndCapped(t *testing.T) {
-	for attempt := 0; attempt < 10; attempt++ {
+	for attempt := 0; attempt < 12; attempt++ {
 		d := backoffDuration(attempt, maxBackoff)
 		if d <= 0 {
 			t.Fatalf("attempt %d: expected positive duration, got %v", attempt, d)
@@ -138,19 +185,12 @@ func TestBackoffDuration_MonotonicAndCapped(t *testing.T) {
 			t.Fatalf("attempt %d: exceeded cap: %v", attempt, d)
 		}
 	}
-	for attempt := 0; attempt < 10; attempt++ {
-		d := backoffDuration(attempt, max429Backoff)
-		if d > max429Backoff {
-			t.Fatalf("attempt %d: exceeded 429 cap: %v", attempt, d)
-		}
-	}
 }
 
 func TestRetryAfter_SecondsForm(t *testing.T) {
 	h := http.Header{}
 	h.Set("Retry-After", "5")
-	d := retryAfter(h)
-	if d != 5*time.Second {
+	if d := retryAfter(h); d != 5*time.Second {
 		t.Fatalf("expected 5s, got %v", d)
 	}
 }
@@ -158,8 +198,7 @@ func TestRetryAfter_SecondsForm(t *testing.T) {
 func TestRetryAfter_CapsAtMax(t *testing.T) {
 	h := http.Header{}
 	h.Set("Retry-After", "99999")
-	d := retryAfter(h)
-	if d != maxRetryAfter {
+	if d := retryAfter(h); d != maxRetryAfter {
 		t.Fatalf("expected capped at %v, got %v", maxRetryAfter, d)
 	}
 }

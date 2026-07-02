@@ -2,6 +2,7 @@ package fetch
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,7 +13,13 @@ const (
 	defaultBodyCap = 4 << 20  // 4MB
 	largeBodyCap   = 16 << 20 // 16MB — one-shot recovery when truncation is suspected
 	requestTimeout = 20 * time.Second
-	userAgent      = "fad-qa/1.0 (Realift SDK QA crawler)"
+
+	// maxAttempts bounds retries for network errors and 5xx.
+	maxAttempts = 5
+	maxBackoff  = 30 * time.Second
+
+	baseBackoff   = 500 * time.Millisecond
+	maxRetryAfter = 120 * time.Second
 )
 
 // Result is the outcome of successfully fetching one URL (a definitive HTTP
@@ -26,10 +33,10 @@ type Result struct {
 	FinalURL   string
 }
 
-// GetPage fetches url with adaptive rate limiting, retry, and exponential
-// backoff. A non-nil error means the retry budget was exhausted or ctx was
-// cancelled — callers should record this as an ERROR verdict, distinct from
-// any HTTP-status-based classification.
+// GetPage fetches url with adaptive pacing, challenge handling, and retry.
+// A non-nil error means the retry budget was exhausted, the store is blocking
+// us (errors.Is(err, ErrBlocked)), or ctx was cancelled — callers record
+// these as an ERROR verdict.
 func GetPage(ctx context.Context, client *http.Client, limiter *Limiter, url string) (Result, error) {
 	return getPage(ctx, client, limiter, url, defaultBodyCap)
 }
@@ -40,75 +47,82 @@ func GetPageLarge(ctx context.Context, client *http.Client, limiter *Limiter, ur
 	return getPage(ctx, client, limiter, url, largeBodyCap)
 }
 
-// getPage retries with two independent budgets: a short one for network
-// errors and 5xx (maxAttempts, capped backoff at maxBackoff — these either
-// resolve fast or the page is genuinely broken), and a much more patient
-// one for 429/503 (max429Attempts, capped backoff at max429Backoff, plus a
-// shared limiter-wide Cooldown so every other in-flight worker also backs
-// off) — some stores, especially Shopify preview/dev-store domains,
-// rate-limit hard enough that the short budget alone turns most of a run
-// into ERROR results instead of real verdicts.
 func getPage(ctx context.Context, client *http.Client, limiter *Limiter, url string, cap int64) (Result, error) {
 	var lastErr error
 	var lastStatus int
-	otherAttempts, throttleAttempts := 0, 0
+	netAttempts, throttleAttempts := 0, 0
 
-retryLoop:
 	for {
 		if err := limiter.Acquire(ctx); err != nil {
+			// ErrBlocked (given up) or ctx cancelled — either way, stop.
+			if errors.Is(err, ErrBlocked) {
+				return Result{StatusCode: lastStatus}, fmt.Errorf("fetch %s: %w", url, err)
+			}
 			return Result{}, err
 		}
-		body, status, header, finalURL, retryAfterDur, err := doOnce(ctx, client, url, cap)
+		res := doOnce(ctx, client, url, cap)
 		limiter.Release()
 
-		if err != nil {
-			lastErr = err
-			otherAttempts++
-			if otherAttempts >= maxAttempts {
-				break retryLoop
+		if res.err != nil {
+			lastErr = res.err
+			netAttempts++
+			if netAttempts >= maxAttempts {
+				break
 			}
-			if waitErr := sleepCtx(ctx, backoffDuration(otherAttempts-1, maxBackoff)); waitErr != nil {
+			if waitErr := sleepCtx(ctx, backoffDuration(netAttempts-1, maxBackoff)); waitErr != nil {
 				return Result{}, waitErr
 			}
 			continue
 		}
-		lastStatus = status
+		lastStatus = res.status
 		lastErr = nil
 
 		switch {
-		case status == http.StatusOK:
-			limiter.OnSuccess()
-			return Result{Body: body, StatusCode: status, Attempts: otherAttempts + throttleAttempts + 1, Header: header, FinalURL: finalURL}, nil
-
-		case status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable:
-			throttleAttempts++
-			d := retryAfterDur
-			if d == 0 {
-				d = backoffDuration(throttleAttempts-1, max429Backoff)
-			}
-			limiter.OnThrottle()
-			limiter.Cooldown(d)
-			if throttleAttempts >= max429Attempts {
-				break retryLoop
-			}
-			if waitErr := sleepCtx(ctx, d); waitErr != nil {
-				return Result{}, waitErr
+		case res.isChallenge:
+			// Cloudflare bot gate. The limiter opens a single shared cooldown
+			// for the episode; the next Acquire waits it out, then this request
+			// retries. Retrying harder is futile — only the crawl-wide slowdown
+			// helps. The limiter is the sole give-up authority: once it has
+			// ridden out enough consecutive escalating episodes with no
+			// recovery, OnChallenge returns false and we stop (ErrBlocked),
+			// which also latches so every other in-flight request bails fast.
+			if !limiter.OnChallenge() {
+				return Result{StatusCode: res.status}, fmt.Errorf("fetch %s: %w", url, ErrBlocked)
 			}
 			continue
 
-		case status >= 500:
-			otherAttempts++
-			if otherAttempts >= maxAttempts {
-				break retryLoop
+		case res.status == http.StatusOK:
+			limiter.OnSuccess()
+			return res.result(), nil
+
+		case res.status == http.StatusTooManyRequests || res.status == http.StatusServiceUnavailable:
+			// Genuine Shopify quota throttle (has Retry-After, not a CF
+			// challenge). Respect the server's timer.
+			throttleAttempts++
+			d := res.retryAfter
+			if d == 0 {
+				d = backoffDuration(throttleAttempts-1, maxRetryAfter)
 			}
-			if waitErr := sleepCtx(ctx, backoffDuration(otherAttempts-1, maxBackoff)); waitErr != nil {
+			limiter.OnThrottle()
+			limiter.Cooldown(d)
+			if throttleAttempts >= maxAttempts {
+				break
+			}
+			continue
+
+		case res.status >= 500:
+			netAttempts++
+			if netAttempts >= maxAttempts {
+				break
+			}
+			if waitErr := sleepCtx(ctx, backoffDuration(netAttempts-1, maxBackoff)); waitErr != nil {
 				return Result{}, waitErr
 			}
 			continue
 
 		default:
-			// 404/401/403/etc: definitive, no retry — caller decides verdict.
-			return Result{Body: body, StatusCode: status, Attempts: otherAttempts + throttleAttempts + 1, Header: header, FinalURL: finalURL}, nil
+			// 404/401/403 (non-challenge): definitive, no retry.
+			return res.result(), nil
 		}
 	}
 
@@ -118,38 +132,55 @@ retryLoop:
 	return Result{StatusCode: lastStatus}, fmt.Errorf("fetch %s: exhausted retries (last status %d)", url, lastStatus)
 }
 
-func doOnce(ctx context.Context, client *http.Client, url string, cap int64) (body []byte, status int, header http.Header, finalURL string, retryAfterDur time.Duration, err error) {
+// onceResult bundles everything doOnce observed about a single HTTP attempt.
+type onceResult struct {
+	body        []byte
+	status      int
+	header      http.Header
+	finalURL    string
+	retryAfter  time.Duration
+	isChallenge bool
+	err         error
+}
+
+func (o onceResult) result() Result {
+	return Result{Body: o.body, StatusCode: o.status, Header: o.header, FinalURL: o.finalURL, Attempts: 1}
+}
+
+func doOnce(ctx context.Context, client *http.Client, url string, cap int64) onceResult {
 	reqCtx, cancel := context.WithTimeout(ctx, requestTimeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, 0, nil, "", 0, err
+		return onceResult{err: err}
 	}
-	req.Header.Set("User-Agent", userAgent)
-	req.Header.Set("Accept", "text/html")
+	applyBrowserHeaders(req)
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, 0, nil, "", 0, err
+		return onceResult{err: err}
 	}
 	defer func() {
 		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 	}()
 
-	status = resp.StatusCode
-	header = resp.Header
+	out := onceResult{status: resp.StatusCode, header: resp.Header}
 	if resp.Request != nil && resp.Request.URL != nil {
-		finalURL = resp.Request.URL.String()
-	}
-	if status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable {
-		retryAfterDur = retryAfter(resp.Header)
+		out.finalURL = resp.Request.URL.String()
 	}
 
-	body, err = io.ReadAll(io.LimitReader(resp.Body, cap))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, cap))
 	if err != nil {
-		return nil, status, header, finalURL, retryAfterDur, err
+		out.err = err
+		return out
 	}
-	return body, status, header, finalURL, retryAfterDur, nil
+	out.body = body
+
+	out.isChallenge = isCloudflareChallenge(out.status, out.header, out.body)
+	if !out.isChallenge && (out.status == http.StatusTooManyRequests || out.status == http.StatusServiceUnavailable) {
+		out.retryAfter = retryAfter(resp.Header)
+	}
+	return out
 }
