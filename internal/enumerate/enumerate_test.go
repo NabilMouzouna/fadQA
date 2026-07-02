@@ -199,7 +199,7 @@ func TestDetect_ShopifyMarkerAndPasswordLock(t *testing.T) {
 	defer srv.Close()
 
 	e := newTestEnumerator()
-	canonical, isShopify, passwordLock, _, err := e.detect(context.Background(), srv.URL)
+	canonical, isShopify, passwordLock, _, _, err := e.detect(context.Background(), srv.URL)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -221,7 +221,7 @@ func TestDetect_NotShopify(t *testing.T) {
 	defer srv.Close()
 
 	e := newTestEnumerator()
-	_, isShopify, passwordLock, _, err := e.detect(context.Background(), srv.URL)
+	_, isShopify, passwordLock, _, _, err := e.detect(context.Background(), srv.URL)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

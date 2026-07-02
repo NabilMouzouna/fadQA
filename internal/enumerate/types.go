@@ -20,5 +20,6 @@ type EnumResult struct {
 	IsShopify     bool
 	PasswordLock  bool
 	CanonicalHost string
+	ShopName      string // best-effort friendly name (og:site_name / host)
 	Warnings      []string
 }

@@ -32,7 +32,7 @@ func (e *Enumerator) Enumerate(ctx context.Context, rawStoreURL string) (EnumRes
 		return EnumResult{}, err
 	}
 
-	canonical, isShopify, passwordLock, warnings, err := e.detect(ctx, base)
+	canonical, isShopify, passwordLock, shopName, warnings, err := e.detect(ctx, base)
 	if err != nil {
 		return EnumResult{}, err
 	}
@@ -41,6 +41,7 @@ func (e *Enumerator) Enumerate(ctx context.Context, rawStoreURL string) (EnumRes
 		IsShopify:     isShopify,
 		PasswordLock:  passwordLock,
 		CanonicalHost: canonical,
+		ShopName:      shopName,
 		Warnings:      warnings,
 	}
 
@@ -114,11 +115,12 @@ var shopifyBodyMarkers = [][]byte{
 
 // detect issues one request to the store root, follows redirects, and
 // classifies the result as Shopify/not, password-locked/not, adopting the
-// final (post-redirect) host as canonical for all subsequent requests.
-func (e *Enumerator) detect(ctx context.Context, base string) (canonical string, isShopify bool, passwordLock bool, warnings []string, err error) {
+// final (post-redirect) host as canonical for all subsequent requests. It
+// also lifts a best-effort shop display name off the homepage.
+func (e *Enumerator) detect(ctx context.Context, base string) (canonical string, isShopify bool, passwordLock bool, shopName string, warnings []string, err error) {
 	result, ferr := fetch.GetPage(ctx, e.Client, e.Limiter, base+"/")
 	if ferr != nil {
-		return base, false, false, nil, fmt.Errorf("could not reach %s: %w", base, ferr)
+		return base, false, false, "", nil, fmt.Errorf("could not reach %s: %w", base, ferr)
 	}
 
 	canonical = base
@@ -141,7 +143,8 @@ func (e *Enumerator) detect(ctx context.Context, base string) (canonical string,
 		}
 	}
 
-	return canonical, isShopify, passwordLock, warnings, nil
+	shopName = extractShopName(result.Body, canonical)
+	return canonical, isShopify, passwordLock, shopName, warnings, nil
 }
 
 func isShopifyResponse(r fetch.Result) bool {
