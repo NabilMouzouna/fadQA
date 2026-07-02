@@ -139,6 +139,12 @@ main.go               CLI flags + orchestration.
   for thousands of products) so new/removed products are always detected;
   it only skips the expensive per-product-page fetch for products that
   already passed last run.
+- `--out`/`--cache` default to `reports/`/`cache/` next to the *executable*
+  (`main.go`'s `defaultBaseDir`, via `os.Executable()` + symlink
+  resolution), not the current working directory. This matters once the
+  binary is distributed standalone — a double-clicked exe or a shortcut
+  can have an unpredictable CWD, but should still self-create its folders
+  in a consistent, discoverable place next to itself.
 
 ## Build / test
 
@@ -153,6 +159,9 @@ GOOS=darwin  GOARCH=arm64 go build -o fad-qa-darwin-arm64 .
 GOOS=darwin  GOARCH=amd64 go build -o fad-qa-darwin-amd64 .
 GOOS=windows GOARCH=amd64 go build -o fad-qa-windows-amd64.exe .
 GOOS=windows GOARCH=arm64 go build -o fad-qa-windows-arm64.exe .
+
+# build + package all four for distribution (zips each with README into dist/):
+./build.sh
 ```
 
 ## Workflow rules for this repo
@@ -242,3 +251,27 @@ GOOS=windows GOARCH=arm64 go build -o fad-qa-windows-arm64.exe .
   redraw both in place — see `internal/ui/progress.go`. Not unit-tested
   (terminal escape-sequence output isn't meaningfully testable); verify
   visually in a real terminal if this rendering is touched again.
+
+- **2026-07-02**: User wants teammates to run fad-qa without cloning the
+  repo or installing Go — hand them a built binary and have it "just
+  work". Two changes:
+  1. `--out`/`--cache` previously defaulted to `./reports`/`./cache`
+     relative to the process's **current working directory**. That's fine
+     for a `cd`-then-run terminal workflow, but breaks for a distributed
+     binary launched via double-click or a shortcut, where CWD is
+     unpredictable. Added `defaultBaseDir()` in `main.go` (`os.Executable()`
+     + `filepath.EvalSymlinks`) so both now default to `reports/`/`cache/`
+     next to the binary itself, regardless of invocation CWD. Verified by
+     building to a scratch dir and running from an unrelated CWD (`/tmp`)
+     — folders correctly appeared next to the binary, not in `/tmp`.
+     Folder creation itself was already handled (`os.MkdirAll` in
+     `cache.Save`/`report.Write`); the only gap was *where*.
+  2. Added `build.sh`: cross-compiles macOS (arm64 + amd64) and Windows
+     (amd64 + arm64), zips each with `README.md` into `dist/` (gitignored)
+     — a teammate just unzips and runs, no Go or repo needed. Verified a
+     packaged zip unzips with the exec bit intact and runs standalone.
+     Documented both the teammate quick-start (including macOS Gatekeeper
+     right-click-Open and Windows SmartScreen "Run anyway" first-launch
+     steps — real friction points for handing out an unsigned binary) and
+     the maintainer build/distribute workflow in README.md, splitting it
+     from the general "Usage" section since those audiences differ.
