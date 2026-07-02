@@ -85,9 +85,11 @@ visible `PASS` for review — they can never override the ground-truth
 internal/enumerate/  Shopify detection (redirects, password-lock), product
                       discovery via /products.json → /collections/all →
                       sitemap.xml fallback chain, dedupe by handle.
-internal/fetch/       Shared http.Client, AIMD adaptive rate/concurrency
-                      limiter (halves on 429/503, grows after a clean
-                      streak), exponential backoff + Retry-After handling.
+internal/fetch/       Browser-like http.Client (Chrome UA, headers, cookie
+                      jar); adaptive ramp-up limiter that self-discovers a
+                      safe speed and handles Cloudflare challenges distinctly
+                      from Shopify quota 429s (challenge.go); backoff +
+                      Retry-After. See the Cloudflare section below.
 internal/verdict/     Streaming HTML extraction (x/net/html tokenizer, no
                       full DOM) of the three signals, the verdict
                       classifier, and the advisory relevance dictionaries.
@@ -111,26 +113,65 @@ internal/ui/          Terminal presentation: color/TTY detection, phased
 main.go               CLI flags + orchestration.
 ```
 
+## The Cloudflare bot-management problem (most important operational fact)
+
+Shopify storefronts sit behind **Cloudflare bot management**, which is what
+actually limits us — NOT Shopify's API quota. Empirically confirmed against
+a live `*.shopifypreview.com` store (2026-07-02):
+
+- A throttled request returns **HTTP 429 with a `cf-mitigated: challenge`
+  header** and a "Verifying your connection..." HTML body — a JavaScript
+  challenge, **not** a JSON quota error. There is **no `Retry-After`**.
+- It's a **per-IP reputation score**, cumulative over a time window. Serial
+  1 req/s is fine; concurrency 8 trips it; after ~150–200 total requests in
+  a few minutes the IP flips to "challenge everything" mode where *every*
+  request (even 1/20s) gets 429.
+- Recovery is **slow: ~4 minutes of near-idle** after heavy flagging.
+- A plain HTTP client can NEVER solve the JS challenge — retrying harder is
+  futile; only slowing down and letting the score decay works.
+- The User-Agent is a *minor* factor (serial requests passed with either
+  UA); **concurrency/rate is the real trigger.**
+
+The old design mistook these for Shopify quota-429s and applied escalating
+90s cooldowns shared across 8 workers → once flagged, the whole fleet froze
+permanently (a real run did **24 products in an hour**). That's the bug the
+current design fixes.
+
 ## Defaults worth knowing
 
-- Concurrency: 8 workers default (1–32 range), rate 6 req/s steady-state,
-  AIMD halves both on 429/503 and grows by 1 after 20 clean successes.
-- Retry has two independent budgets (`internal/fetch/get.go`,
-  `backoff.go`): network errors and 5xx get 5 attempts, exponential
-  backoff 500ms×2^n capped at 30s. **429/503 get 10 attempts, capped at
-  90s**, and *also* trip `Limiter.Cooldown()` — a hard, shared pause that
-  blocks every worker's next `Acquire`, not just the throttled request.
-  This exists because a soft AIMD halving alone isn't enough: several
-  already-in-flight workers can land on the rate limit in the same window
-  before the halving takes effect, especially on `*.shopifypreview.com`
-  dev/preview domains, which rate-limit far harder than production
-  storefronts (a real run against one saw 81/104 products fail before
-  this fix — see 2026-07-01 session log below). `Retry-After` overrides
-  the computed backoff when present (capped at 120s either way).
-- **Second-chance pass**: after the main concurrent run, `main.go`'s
-  `retryErrored` re-tests anything still `ERROR`, one at a time at 1
-  req/s with a fresh limiter — by then the store has usually cooled down.
-  Anything still failing after that is a genuine, reportable ERROR.
+- Concurrency/rate are **ceilings the adaptive limiter ramps UP toward**,
+  not starting values. Default max 4 workers / 4 req/s (was 8/6 — 8 tripped
+  Cloudflare in testing). `NewLimiter` starts at 2 workers / 2 req/s and
+  adds 1 of each per `rampStreak` (30) clean successes. This self-discovers
+  a safe speed per store/IP instead of hardcoding a magic number.
+- **Challenge handling** (`internal/fetch/{challenge,limiter,get}.go`):
+  `isCloudflareChallenge` distinguishes a CF challenge (cf-mitigated header
+  / challenge body markers / no Retry-After) from a genuine Shopify quota
+  429 (has Retry-After). On a challenge, `Limiter.OnChallenge` drops to
+  concurrency 1 + min rate and opens ONE shared, escalating global cooldown
+  for the episode (60s → 120s → 240s); simultaneous detections by other
+  workers coalesce into that one episode. After `maxChallengeStreak` (3)
+  consecutive escalating episodes with no success between, it **gives up**
+  (`ErrBlocked`, latched) so the whole run ends cleanly instead of grinding
+  — any single success resets the streak to 0. A genuine Retry-After 429
+  still uses the old softer `OnThrottle` + `Cooldown(retryAfter)` path.
+- **Browser-like signature** (`client.go`): realistic Chrome UA + Accept /
+  Accept-Language / sec-ch-ua / Sec-Fetch headers + a `cookiejar` so the
+  session cookies from the first request are echoed back (looks like one
+  visitor, not thousands of cookieless hits). NOT evasion — these are
+  public pages any browser can fetch; we just avoid looking gratuitously
+  robotic. (Do NOT set Accept-Encoding manually — Go only auto-gunzips when
+  it added that header itself.)
+- **Cooldown visibility**: `Limiter.SetCooldownHook` fires once per episode;
+  `main.go` surfaces it via `ProductBar.Note` (clean redraw around the live
+  bar) or `ui.Warn`, so a legitimate multi-minute pause never looks frozen.
+- Retry budgets (`get.go`): network errors and 5xx get 5 attempts, exp
+  backoff 500ms×2^n capped 30s. Retry-After 429 respected (cap 120s).
+- **Second-chance pass**: after the main run, `main.go`'s `retryErrored`
+  re-tests anything still `ERROR` serially (concurrency 1) with a fresh
+  limiter — but it is **skipped if the store gave up** (`limiter.GivenUp()`
+  — retrying would just re-block), and it waits 60s first if the main run
+  hit any challenges (let the score decay).
 - Body cap 4MB per page, one-shot retry at 16MB if a script tag looks
   truncated.
 - `/products.json` pages at 250/page (Shopify's max), hard stop at page
@@ -324,3 +365,24 @@ GOOS=windows GOARCH=arm64 go build -o fad-qa-windows-arm64.exe .
   - Publishing a new release (documented in README): `./build.sh`, tag,
     push tag, then create a GitHub Release for that tag with the four
     `dist/*.zip` files attached as assets.
+
+- **2026-07-02 (Cloudflare rate-limit rework)**: A 2750-product run did only
+  24 products in an hour. Investigated empirically against the live store
+  (see "The Cloudflare bot-management problem" section above) and confirmed
+  the 429s are Cloudflare JS challenges (`cf-mitigated: challenge`, no
+  Retry-After), triggered by concurrency/cumulative per-IP volume, with ~4min
+  recovery — and that the old shared-90s-cooldown-per-429 logic death-spiralled
+  the whole fleet. Reworked `internal/fetch`: added `challenge.go`
+  (isCloudflareChallenge / IsChallengeBody), rebuilt `limiter.go` into an
+  adaptive ramp-up limiter with a distinct `OnChallenge` path (drop to floor +
+  single escalating shared cooldown per episode + give-up after 3 consecutive
+  episodes → `ErrBlocked`), and browser-ified `client.go`/`get.go` (Chrome UA,
+  browser headers, cookie jar). Lowered defaults to 4/4 ceilings (ramp from
+  2/2). `main.go`: cooldown hook → `ProductBar.Note`/`ui.Warn` so pauses are
+  visible; `IsChallengeBody` guard so a 200-challenge isn't misread as
+  FAIL_SDK_OFF; `retryErrored` now skips when the store gave up and settles
+  60s first if the main run was challenged; store-level findings explain a
+  blocked/rate-limited run. Live-validated challenge detection, cooldown UI,
+  and recovery against the real store (the IP was still flagged from probing,
+  so it correctly paused 60s during enumeration then recovered). Unit tests
+  cover the limiter escalation/give-up/coalescing and challenge detection.

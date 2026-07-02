@@ -155,8 +155,8 @@ vX.Y.Z dist/*.zip` if you have the GitHub CLI installed).
 | `--store` | *(required)* | Shopify store URL to test |
 | `--app` | *(required)* | `realfoot` \| `realhand` \| `realbody` \| `foot3d` |
 | `--mode` | `full` | `full` tests every product; `quick` retests only previous failures/errors |
-| `--workers` | `8` | Max concurrent requests (1–32) |
-| `--rate` | `6` | Steady-state requests per second |
+| `--workers` | `4` | Max concurrent requests, 1–32 (a ceiling — see below) |
+| `--rate` | `4` | Max steady-state requests per second (a ceiling) |
 | `--out` | `reports/` next to the binary | Directory to write the Markdown report to |
 | `--cache` | `cache/` next to the binary | Directory holding per-store cache files |
 | `--verbose` | off | Print a line per product instead of a progress bar |
@@ -164,10 +164,30 @@ vX.Y.Z dist/*.zip` if you have the GitHub CLI installed).
 | `--no-notify` | off | Disable the desktop notification |
 | `--no-keepawake` | off | Allow the machine to sleep during the run |
 
-If a store rate-limits aggressively (common on `*.shopifypreview.com`
-dev/preview domains), you don't need to tune these — the tool backs off
-automatically and retries anything that still comes back unreachable at
-the end of the run, one at a time, before giving up on it.
+## About speed and rate limiting
+
+Shopify storefronts sit behind **Cloudflare bot protection**, which limits
+how fast *any* automated client can crawl from a single IP — this is not
+something the tool (or your Realift setup) is doing wrong. Cloudflare tracks
+a per-IP reputation score; push too hard and it starts serving "verify your
+connection" challenges to everything for a few minutes.
+
+So `--workers` and `--rate` are **ceilings, not fixed speeds**. The tool
+starts slow, ramps up while the store stays happy, and the moment it sees a
+Cloudflare challenge it drops to a crawl and **pauses to let the limit
+clear** (you'll see a `[waiting]` message with a countdown — that's normal,
+not a freeze). It resumes automatically. If a store blocks automated access
+persistently, the tool gives up cleanly and says so in the report rather
+than grinding forever.
+
+Practical notes:
+- Large catalogs from one IP take a while — minutes, not seconds — and that
+  is the polite, safe speed. Raising `--rate`/`--workers` past the defaults
+  usually just trips Cloudflare sooner and ends up **slower** overall.
+- Re-run with `--mode quick` after a fix: it only re-fetches products that
+  previously failed/errored, so it's far lighter on the rate limit.
+- `*.shopifypreview.com` preview/dev-store URLs are throttled much harder
+  than a live production storefront — expect more pausing on those.
 
 ## Project layout
 
