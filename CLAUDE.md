@@ -1,5 +1,11 @@
 # fad-qa — context for future sessions
 
+> **This repo (`github.com/NabilMouzouna/fadQA`) is public as of
+> 2026-07-02**, to support unauthenticated `curl`-based install for
+> teammates. Everything in this file, including the reverse-engineered
+> Realift internals below, is publicly visible — keep that in mind before
+> adding anything more sensitive here.
+
 ## What this is
 
 A standalone Go CLI that QA-tests whether the Realift size-measurement
@@ -275,3 +281,46 @@ GOOS=windows GOARCH=arm64 go build -o fad-qa-windows-arm64.exe .
      steps — real friction points for handing out an unsigned binary) and
      the maintainer build/distribute workflow in README.md, splitting it
      from the general "Usage" section since those audiences differ.
+
+- **2026-07-02 (same day, follow-up)**: User wants a one-command `curl`
+  install for teammates. This repo was **private**, and a plain
+  unauthenticated `curl` against GitHub Release assets only works on a
+  public repo — flagged the trade-off (this repo's `CLAUDE.md` documents
+  Realift's internal keyword-matching/exclusion logic, reverse-engineered
+  from the main app's private source) via AskUserQuestion; user initially
+  chose a separate binaries-only public repo, then instead made this repo
+  itself public directly. Proceeded on that basis. Set up:
+  - Tagged `v0.1.0` on `main`, created a GitHub Release via the REST API
+    (no `gh` CLI available in this environment) using the same credential
+    already used for `git push` all session, and uploaded the four
+    `build.sh` zips as release assets. `https://github.com/<repo>/releases/
+    latest/download/<asset>` is a stable redirect that always points at
+    whichever release is newest — install commands never need to know a
+    version number.
+  - `install.sh` (macOS only — checks `uname -s == Darwin`, exits with a
+    pointer to the Windows instructions otherwise): `curl -fsSL .../
+    install.sh | bash` downloads the right arch's release zip, extracts
+    just the `fad-qa` binary into the current directory, chmods it
+    executable, and defensively clears `com.apple.quarantine` (curl
+    downloads don't set it the way browser downloads do — verified
+    empirically: only the newer, non-blocking `com.apple.provenance`
+    attribute was present, not `quarantine`, so no Gatekeeper block on
+    a terminal-launched run).
+  - **Windows explicitly does NOT get `install.sh`** — a `.sh` script
+    can't run there without WSL/Git Bash/Cygwin, none of which should be
+    assumed present. Windows instead gets a native two-command flow using
+    `curl.exe` + `tar` (both ship built into Windows 10 1803+/11 without
+    any extra install), documented separately in the README.
+  - Verified the *exact* documented command end-to-end from a clean
+    directory (`curl -fsSL .../install.sh | bash`) — downloaded, installed,
+    and ran the real binary successfully, confirming the whole pipeline
+    (public repo → release → asset → install script) actually works, not
+    just that each piece looks right in isolation.
+  - Learned (and saved to persistent memory): don't proactively pull and
+    test stored credentials (e.g. `git credential fill` + a probing API
+    call) before deciding how to proceed — just attempt the real intended
+    action directly. The user declined exactly that kind of speculative
+    check earlier in this same task.
+  - Publishing a new release (documented in README): `./build.sh`, tag,
+    push tag, then create a GitHub Release for that tag with the four
+    `dist/*.zip` files attached as assets.
