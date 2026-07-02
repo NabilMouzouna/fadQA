@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -78,15 +79,39 @@ func main() {
 	}
 }
 
+// defaultBaseDir resolves to the directory containing the running
+// executable (following symlinks, so a Homebrew-style symlinked install
+// still resolves to the real binary's location), not the current working
+// directory. This is what lets fad-qa self-create its cache/ and reports/
+// folders next to itself no matter where or how it's launched — a
+// double-clicked exe, a shortcut, or a terminal opened in an unrelated
+// directory — which matters once the binary is handed to teammates who
+// don't have the repo checked out at all. Falls back to "." if the OS
+// can't report the executable path (rare).
+func defaultBaseDir() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return "."
+	}
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+	return filepath.Dir(exe)
+}
+
 func parseFlags() options {
+	base := defaultBaseDir()
+	defaultOut := filepath.Join(base, "reports")
+	defaultCache := filepath.Join(base, "cache")
+
 	var o options
 	flag.StringVar(&o.store, "store", "", "Shopify store URL to test (required)")
 	flag.StringVar(&o.appType, "app", "", "app type: realfoot | realhand | realbody | foot3d (required)")
 	flag.StringVar(&o.mode, "mode", "full", "test mode: full | quick (quick retests only previously-failing products)")
 	flag.IntVar(&o.workers, "workers", 8, "max concurrent requests (1-32)")
 	flag.Float64Var(&o.rate, "rate", 6, "steady-state requests per second")
-	flag.StringVar(&o.outDir, "out", "./reports", "directory to write the Markdown report to")
-	flag.StringVar(&o.cacheDir, "cache", "./cache", "directory holding per-store cache files")
+	flag.StringVar(&o.outDir, "out", defaultOut, "directory to write the Markdown report to (default: next to the executable)")
+	flag.StringVar(&o.cacheDir, "cache", defaultCache, "directory holding per-store cache files (default: next to the executable)")
 	flag.BoolVar(&o.noSound, "no-sound", false, "disable completion sound")
 	flag.BoolVar(&o.noNotify, "no-notify", false, "disable desktop notification")
 	flag.BoolVar(&o.noKeepAwake, "no-keepawake", false, "don't prevent the machine from sleeping during the run")
