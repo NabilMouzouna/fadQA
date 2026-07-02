@@ -150,3 +150,22 @@ func TestPost_Non2xxIsError(t *testing.T) {
 		t.Fatalf("expected error on non-2xx")
 	}
 }
+
+func TestPost_200ButNotOkIsError(t *testing.T) {
+	// An invalid/expired webhook 302-redirects to Slack's docs; the default
+	// client follows it and yields a 200 HTML page. That must NOT be treated
+	// as success.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("<!doctype html><html>Slack developer docs</html>"))
+	}))
+	defer srv.Close()
+	cfg := &Config{WebhookURL: srv.URL}
+	err := cfg.Post(context.Background(), srv.Client(), Report{})
+	if err == nil {
+		t.Fatalf("expected error when body is not \"ok\"")
+	}
+	if !strings.Contains(err.Error(), "invalid") {
+		t.Fatalf("error should hint the webhook is invalid, got: %v", err)
+	}
+}

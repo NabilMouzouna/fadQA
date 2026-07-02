@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -112,10 +113,33 @@ func (c *Config) Post(ctx context.Context, client *http.Client, r Report) error 
 		return err
 	}
 	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("slack webhook returned HTTP %d", resp.StatusCode)
+		return fmt.Errorf("slack webhook returned HTTP %d: %s", resp.StatusCode, snippet(respBody))
+	}
+	// A valid Slack Incoming Webhook always replies with the body "ok". Any
+	// other 2xx body means the request was redirected/absorbed elsewhere —
+	// most commonly an invalid/expired/incomplete webhook URL, which Slack
+	// 302-redirects to its docs site (a 200 HTML page). Treat that as failure
+	// so we never falsely report "sent".
+	if strings.TrimSpace(string(respBody)) != "ok" {
+		return fmt.Errorf("slack webhook did not return \"ok\" (got: %s) — the webhook URL in .env is likely invalid, expired, or incomplete (an Incoming Webhook looks like https://hooks.slack.com/services/T.../B.../secret with all three path parts)", snippet(respBody))
 	}
 	return nil
+}
+
+// snippet returns a short, single-line preview of a response body for error
+// messages (HTML error pages can be huge).
+func snippet(b []byte) string {
+	s := strings.TrimSpace(string(b))
+	s = strings.Join(strings.Fields(s), " ")
+	if len(s) > 120 {
+		s = s[:120] + "…"
+	}
+	if s == "" {
+		return "(empty)"
+	}
+	return s
 }
 
 func firstNonEmpty(vals ...string) string {
