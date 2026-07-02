@@ -23,6 +23,7 @@ import (
 	"github.com/realift/fad-qa/internal/notify"
 	"github.com/realift/fad-qa/internal/pool"
 	"github.com/realift/fad-qa/internal/report"
+	"github.com/realift/fad-qa/internal/slack"
 	"github.com/realift/fad-qa/internal/ui"
 	"github.com/realift/fad-qa/internal/verdict"
 )
@@ -179,10 +180,10 @@ func run(ctx context.Context, opts options) error {
 	now := time.Now()
 
 	if !enumResult.IsShopify || enumResult.PasswordLock {
-		return writeAbortReport(opts, enumResult, now)
+		return writeAbortReport(ctx, client, opts, enumResult, now)
 	}
 	if len(enumResult.Products) == 0 {
-		return writeAbortReport(opts, enumResult, now)
+		return writeAbortReport(ctx, client, opts, enumResult, now)
 	}
 	ui.Success("Shopify store confirmed")
 	ui.Success("Discovered %d products via %s", len(enumResult.Products), enumResult.Method)
@@ -307,8 +308,87 @@ func run(ctx context.Context, opts options) error {
 
 	ui.PrintSummary(allResults)
 
-	notify.Done("fad-qa: run complete", fmt.Sprintf("%s (%s) — %d tested", canonical, opts.appType, total), !opts.noSound, !opts.noNotify)
+	counts := report.Tally(allResults)
+	pass, fail := counts[verdict.PASS], report.FailTotal(counts)
+	skip, errored := counts[verdict.SkipNotRelevant], counts[verdict.Errored]
+	storeName := displayStoreName(enumResult.ShopName, canonical)
+
+	notify.Done(
+		"fad-qa: run complete",
+		fmt.Sprintf("%s (%s): %d passed, %d failed, %d skipped, %d error", storeName, opts.appType, pass, fail, skip, errored),
+		!opts.noSound, !opts.noNotify,
+	)
+
+	postSlack(ctx, client, slack.Report{
+		StoreName: storeName,
+		StoreURL:  canonical,
+		AppType:   opts.appType,
+		Mode:      mode,
+		Date:      now,
+		Products:  len(enumResult.Products),
+		Pass:      pass, Fail: fail, Skip: skip, Errored: errored,
+		Findings: storeFindings,
+		Failures: slackFailures(allResults),
+	})
 	return nil
+}
+
+// displayStoreName prefers the homepage-derived shop name, falling back to
+// the canonical host.
+func displayStoreName(shopName, canonical string) string {
+	if s := strings.TrimSpace(shopName); s != "" {
+		return s
+	}
+	return strings.TrimPrefix(strings.TrimPrefix(canonical, "https://"), "http://")
+}
+
+// slackFailures extracts the failing products for the Slack summary, capped
+// so the message stays within Slack's block limits.
+func slackFailures(results []verdict.ProductResult) []slack.Failure {
+	var out []slack.Failure
+	for _, r := range results {
+		if !r.Verdict.IsFail() {
+			continue
+		}
+		out = append(out, slack.Failure{Title: r.Title, URL: r.URL, Verdict: string(r.Verdict), Reason: r.Reason})
+		if len(out) >= 50 {
+			break
+		}
+	}
+	return out
+}
+
+// postSlack posts the run summary to Slack if a .env with a webhook is found
+// next to the binary (or in the working directory). Best-effort: a missing
+// config is silent, a delivery failure is a warning, never fatal.
+func postSlack(ctx context.Context, client *http.Client, r slack.Report) {
+	var cfg *slack.Config
+	for _, dir := range []string{defaultBaseDir(), "."} {
+		c, ok, err := slack.Load(dir)
+		if err != nil {
+			ui.Warn("could not read .env for Slack in %s: %v", dir, err)
+			continue
+		}
+		if ok {
+			cfg = c
+			break
+		}
+	}
+	if cfg == nil {
+		return // no Slack configured — silently skip
+	}
+	if err := cfg.Post(ctx, client, r); err != nil {
+		ui.Warn("Slack report failed: %v", err)
+		return
+	}
+	ui.Success("Slack report sent%s", channelSuffix(cfg.Channel))
+}
+
+func channelSuffix(ch string) string {
+	if ch == "" {
+		return ""
+	}
+	return " to " + ch
 }
 
 // mergeResults combines this run's freshly-tested results with, in quick
@@ -479,7 +559,7 @@ func retryErrored(ctx context.Context, client *http.Client, mainLimiter *fetch.L
 	return results
 }
 
-func writeAbortReport(opts options, enumResult enumerate.EnumResult, now time.Time) error {
+func writeAbortReport(ctx context.Context, client *http.Client, opts options, enumResult enumerate.EnumResult, now time.Time) error {
 	reason := "Unknown enumeration failure."
 	switch {
 	case !enumResult.IsShopify:
@@ -511,5 +591,16 @@ func writeAbortReport(opts options, enumResult enumerate.EnumResult, now time.Ti
 	}
 	ui.Fail("Could not test this store: %s", reason)
 	ui.Info("Report written to %s", path)
+
+	storeName := displayStoreName(enumResult.ShopName, canonical)
+	notify.Done("fad-qa: run could not complete", fmt.Sprintf("%s (%s): %s", storeName, opts.appType, reason), !opts.noSound, !opts.noNotify)
+	postSlack(ctx, client, slack.Report{
+		StoreName: storeName,
+		StoreURL:  canonical,
+		AppType:   opts.appType,
+		Mode:      opts.mode,
+		Date:      now,
+		Findings:  findings,
+	})
 	return nil
 }
