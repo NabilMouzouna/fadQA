@@ -39,37 +39,65 @@ func TestLimiter_ThrottleHalves(t *testing.T) {
 	}
 }
 
-func TestLimiter_OnChallengeDropsToFloorAndEscalates(t *testing.T) {
+func forceFreshEpisode(l *Limiter) {
+	l.mu.Lock()
+	l.pauseUntil = time.Time{}
+	l.mu.Unlock()
+}
+
+func TestLimiter_OnChallengeDropsToFloor(t *testing.T) {
 	l := NewLimiter(8, 100)
-	for i := 0; i < rampStreak*3; i++ {
-		l.OnSuccess()
-	}
-
-	forceFreshEpisode := func() {
-		l.mu.Lock()
-		l.pauseUntil = time.Time{}
-		l.mu.Unlock()
-	}
-
-	// maxChallengeStreak fresh episodes are tolerated (return true)...
-	for i := 1; i <= maxChallengeStreak; i++ {
-		forceFreshEpisode()
-		if !l.OnChallenge() {
-			t.Fatalf("episode %d: expected to keep going", i)
-		}
-	}
-	cur, rate := l.Snapshot()
-	if cur != 1 || rate != 1 {
+	l.OnSuccess() // avoid give-up
+	l.OnChallenge()
+	if cur, rate := l.Snapshot(); cur != 1 || rate != 1 {
 		t.Fatalf("expected drop to floor (1,1) on challenge, got (%d,%v)", cur, rate)
 	}
+}
 
-	// ...one more distinct episode crosses the cap → give up.
-	forceFreshEpisode()
-	if l.OnChallenge() {
-		t.Fatalf("expected give-up after exceeding the challenge streak")
+func TestLimiter_GivesUpOnlyWhenBlockedFromStart(t *testing.T) {
+	l := NewLimiter(8, 100) // no OnSuccess — simulate a store that blocks from request #1
+	gaveUp := false
+	for i := 0; i < blockedFromStartStreak+2; i++ {
+		forceFreshEpisode(l)
+		if !l.OnChallenge() {
+			gaveUp = true
+			break
+		}
+	}
+	if !gaveUp || !l.GivenUp() {
+		t.Fatalf("expected give-up when blocked from the very start")
 	}
 	if err := l.Acquire(context.Background()); !errors.Is(err, ErrBlocked) {
 		t.Fatalf("expected Acquire to return ErrBlocked once given up, got %v", err)
+	}
+}
+
+func TestLimiter_NeverGivesUpAfterASuccess(t *testing.T) {
+	l := NewLimiter(8, 100)
+	l.OnSuccess() // the store has let something through — it works, just slowly
+	for i := 0; i < blockedFromStartStreak*3; i++ {
+		forceFreshEpisode(l)
+		if !l.OnChallenge() {
+			t.Fatalf("must never give up once a request has succeeded")
+		}
+	}
+	if l.GivenUp() {
+		t.Fatalf("GivenUp must stay false after a success")
+	}
+}
+
+func TestLimiter_ChallengeRatchetsCeilingDown(t *testing.T) {
+	l := NewLimiter(8, 8)
+	l.OnSuccess() // avoid give-up
+	forceFreshEpisode(l)
+	l.OnChallenge() // ceiling 8 -> 4
+	forceFreshEpisode(l)
+	l.OnChallenge() // ceiling 4 -> 2
+	l.mu.Lock()
+	ml, mr := l.maxLimit, l.maxRate
+	l.mu.Unlock()
+	if ml != 2 || mr != 2 {
+		t.Fatalf("expected ceiling ratcheted to 2/2, got %d/%v", ml, mr)
 	}
 }
 

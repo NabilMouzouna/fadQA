@@ -18,6 +18,15 @@ const (
 	maxAttempts = 5
 	maxBackoff  = 30 * time.Second
 
+	// maxReqChallenges is a per-request backstop: how many Cloudflare
+	// cooldowns a SINGLE request rides before it's marked ERROR and the crawl
+	// moves on to the next product (that ERROR is picked up by the retry
+	// pass). This is not a global give-up — other products are still
+	// attempted — it just stops one stubborn URL from looping forever. The
+	// limiter's ceiling ratchet means a working store rarely challenges the
+	// same request more than once or twice.
+	maxReqChallenges = 8
+
 	baseBackoff   = 500 * time.Millisecond
 	maxRetryAfter = 120 * time.Second
 )
@@ -50,7 +59,7 @@ func GetPageLarge(ctx context.Context, client *http.Client, limiter *Limiter, ur
 func getPage(ctx context.Context, client *http.Client, limiter *Limiter, url string, cap int64) (Result, error) {
 	var lastErr error
 	var lastStatus int
-	netAttempts, throttleAttempts := 0, 0
+	netAttempts, throttleAttempts, challengeAttempts := 0, 0, 0
 
 	for {
 		if err := limiter.Acquire(ctx); err != nil {
@@ -80,14 +89,18 @@ func getPage(ctx context.Context, client *http.Client, limiter *Limiter, url str
 		switch {
 		case res.isChallenge:
 			// Cloudflare bot gate. The limiter opens a single shared cooldown
-			// for the episode; the next Acquire waits it out, then this request
-			// retries. Retrying harder is futile — only the crawl-wide slowdown
-			// helps. The limiter is the sole give-up authority: once it has
-			// ridden out enough consecutive escalating episodes with no
-			// recovery, OnChallenge returns false and we stop (ErrBlocked),
-			// which also latches so every other in-flight request bails fast.
+			// for the episode + ratchets the ceiling down; the next Acquire
+			// waits it out, then this request retries. OnChallenge returns
+			// false ONLY if the store is blocked from the very start (no
+			// success ever) — that latches a global give-up. Otherwise we keep
+			// going; the per-request cap below just stops one stubborn URL
+			// from looping forever (it errors and the crawl moves on).
 			if !limiter.OnChallenge() {
 				return Result{StatusCode: res.status}, fmt.Errorf("fetch %s: %w", url, ErrBlocked)
+			}
+			challengeAttempts++
+			if challengeAttempts >= maxReqChallenges {
+				return Result{StatusCode: res.status}, fmt.Errorf("fetch %s: still challenged after %d cooldowns", url, challengeAttempts)
 			}
 			continue
 

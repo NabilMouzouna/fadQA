@@ -18,21 +18,21 @@ const (
 	pollInterval = 5 * time.Millisecond
 
 	// Challenge cooldowns. When Cloudflare starts challenging us the whole
-	// crawl must go quiet long enough for the per-IP score to decay —
-	// measured empirically at ~4 minutes after heavy flagging, faster after a
-	// light trip. We start at 60s (a light trip often clears in one step,
-	// since we also drop to concurrency 1) and double per consecutive episode
-	// up to 4 minutes, which covers even a heavy trip's observed recovery.
+	// crawl must go quiet long enough for the per-IP score to decay. We start
+	// at 60s (a light trip often clears in one step, since we also drop to
+	// concurrency 1 AND ratchet the speed ceiling down) and escalate per
+	// consecutive episode up to 2 minutes.
 	baseChallengeCooldown = 60 * time.Second
-	maxChallengeCooldown  = 240 * time.Second
+	maxChallengeCooldown  = 120 * time.Second
 
-	// maxChallengeStreak is how many consecutive escalating challenge episodes
-	// (with no successful request in between) we ride out before giving up on
-	// the whole run. With the escalation above that's ~60+120+240+240s ≈ 11min
-	// of the store continuously blocking us before we conclude it's genuinely
-	// closed to automated access — at which point continuing is pointless and
-	// rude. Any single success in between resets this to zero.
-	maxChallengeStreak = 3
+	// blockedFromStartStreak is how many consecutive challenge episodes with
+	// NO successful request *ever* we tolerate before concluding the store is
+	// closed to automated access entirely (e.g. a locked preview domain) and
+	// giving up. Crucially this only applies before the first success: once
+	// any product has been fetched, the store clearly works and we NEVER give
+	// up — we just pace down and grind through every product, however slowly.
+	// That's the difference between "blocked" and "merely rate-limited".
+	blockedFromStartStreak = 4
 )
 
 // ErrBlocked is returned by Acquire once the limiter has given up because the
@@ -72,7 +72,8 @@ type Limiter struct {
 	// challenge tracking
 	challengeStreak int  // consecutive challenge episodes with no success since
 	totalChallenges int  // total challenge episodes this run (for reporting)
-	givenUp         bool // set once challengeStreak exceeds the cap
+	hadSuccess      bool // has any request ever succeeded? (gates give-up)
+	givenUp         bool // set only if blocked from the very start
 
 	// cooldown durations, defaulted from the package consts but held as
 	// fields so tests can shrink them to exercise escalation/give-up fast.
@@ -239,12 +240,14 @@ func (l *Limiter) refillLocked() {
 	l.lastRefill = now
 }
 
-// OnSuccess records a clean 200. It clears any challenge streak (recovery
-// worked) and, after rampStreak consecutive successes, nudges concurrency and
-// rate up one step toward their ceilings.
+// OnSuccess records a clean 200. It marks that the store works (which
+// permanently disables give-up), clears the challenge streak, and after
+// rampStreak consecutive successes nudges concurrency and rate up one step
+// toward their (possibly ratcheted-down) ceilings.
 func (l *Limiter) OnSuccess() {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.hadSuccess = true
 	l.challengeStreak = 0
 	l.okStreak++
 	if l.okStreak < rampStreak {
@@ -277,14 +280,19 @@ func (l *Limiter) OnThrottle() {
 	}
 }
 
-// OnChallenge records a Cloudflare bot challenge. Unlike a quota throttle this
-// is a per-IP flag with no server-supplied timer, so the whole crawl must go
-// quiet to let the score decay. It drops to the floor (concurrency 1, min
-// rate) and opens a single shared cooldown for the episode; simultaneous
-// detections by other workers coalesce into that one episode rather than
-// stacking. Consecutive episodes escalate the cooldown, and after too many we
-// give up. Returns true if the caller should keep retrying the request after
-// the cooldown, false if we've given up.
+// OnChallenge records a Cloudflare bot challenge. It drops to the floor
+// (concurrency 1, min rate) AND ratchets the speed *ceiling* down (AIMD:
+// multiplicative decrease of maxLimit/maxRate) so the limiter converges on a
+// rate the store actually tolerates instead of ramping back up and
+// re-tripping. It opens a single shared, escalating cooldown per episode
+// (simultaneous detections by other workers coalesce into it).
+//
+// It only gives up (returns false) if the store has challenged us from the
+// very start with no success ever — a store that's simply closed to
+// automated access. Once ANY request has succeeded, it never gives up:
+// returns true so the caller keeps retrying, and the crawl grinds through
+// every product however slowly. That's the intended behavior — better to be
+// slow than to abandon most of the catalog untested.
 func (l *Limiter) OnChallenge() bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -294,19 +302,39 @@ func (l *Limiter) OnChallenge() bool {
 	l.rate = l.minRate
 
 	// Already cooling down for this episode (another worker got here first) —
-	// don't escalate or re-count; just keep waiting it out.
+	// don't escalate, re-count, or re-ratchet; just keep waiting it out.
 	if time.Now().Before(l.pauseUntil) {
 		return !l.givenUp
 	}
 
 	l.challengeStreak++
 	l.totalChallenges++
-	if l.challengeStreak > maxChallengeStreak {
+
+	// Multiplicative decrease of the ceiling so we settle at a sustainable
+	// pace rather than climbing back to a rate that keeps tripping.
+	if l.maxLimit > l.minLimit {
+		if l.maxLimit /= 2; l.maxLimit < l.minLimit {
+			l.maxLimit = l.minLimit
+		}
+	}
+	if l.maxRate > l.minRate {
+		if l.maxRate /= 2; l.maxRate < l.minRate {
+			l.maxRate = l.minRate
+		}
+	}
+
+	// Give up ONLY if the store never let anything through (blocked from the
+	// start). If it has worked at all, keep going indefinitely.
+	if !l.hadSuccess && l.challengeStreak >= blockedFromStartStreak {
 		l.givenUp = true
 		return false
 	}
 
-	d := l.baseCooldown << (l.challengeStreak - 1)
+	shift := l.challengeStreak - 1
+	if shift > 4 {
+		shift = 4 // guard against overflow on a very long streak
+	}
+	d := l.baseCooldown << shift
 	if d > l.maxCooldown || d <= 0 {
 		d = l.maxCooldown
 	}
