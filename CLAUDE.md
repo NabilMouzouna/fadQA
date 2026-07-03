@@ -156,14 +156,24 @@ current design fixes.
 - **Challenge handling** (`internal/fetch/{challenge,limiter,get}.go`):
   `isCloudflareChallenge` distinguishes a CF challenge (cf-mitigated header
   / challenge body markers / no Retry-After) from a genuine Shopify quota
-  429 (has Retry-After). On a challenge, `Limiter.OnChallenge` drops to
-  concurrency 1 + min rate and opens ONE shared, escalating global cooldown
-  for the episode (60s → 120s → 240s); simultaneous detections by other
-  workers coalesce into that one episode. After `maxChallengeStreak` (3)
-  consecutive escalating episodes with no success between, it **gives up**
-  (`ErrBlocked`, latched) so the whole run ends cleanly instead of grinding
-  — any single success resets the streak to 0. A genuine Retry-After 429
-  still uses the old softer `OnThrottle` + `Cooldown(retryAfter)` path.
+  429 (has Retry-After). On a challenge, `Limiter.OnChallenge`:
+  1. drops current concurrency/rate to the floor (1/1);
+  2. **ratchets the ceiling down** (AIMD multiplicative decrease of
+     `maxLimit`/`maxRate`, floor 1) — this is what makes it converge on a
+     rate the store tolerates instead of ramping back up and re-tripping;
+  3. opens ONE shared, escalating cooldown for the episode (60s → 120s cap;
+     simultaneous detections by other workers coalesce into it).
+  **Give-up policy (important):** it gives up (`ErrBlocked`, latched) ONLY
+  if the store challenged us from the very start with *no success ever*
+  (`!hadSuccess && challengeStreak >= blockedFromStartStreak(4)`) — a store
+  closed to automated access (e.g. a locked preview domain). **Once any
+  request succeeds, it never gives up** — it grinds through every product,
+  however slowly. (Earlier version gave up globally after a few challenges
+  even on a working store, abandoning most of the catalog as ERROR — the
+  regression this fixes.) A per-request backstop (`maxReqChallenges`=8 in
+  get.go) errors one stubborn URL and moves on without a global latch. A
+  genuine Retry-After 429 still uses the softer `OnThrottle` +
+  `Cooldown(retryAfter)` path.
 - **Browser-like signature** (`client.go`): realistic Chrome UA + Accept /
   Accept-Language / sec-ch-ua / Sec-Fetch headers + a `cookiejar` so the
   session cookies from the first request are echoed back (looks like one
@@ -412,3 +422,21 @@ GOOS=windows GOARCH=arm64 go build -o fad-qa-windows-arm64.exe .
   extraction. NOTE: not yet verified against the real webhook (would post a
   live message to the team channel) — the pipeline is proven against an
   httptest server; offer a one-off test post before relying on it.
+
+- **2026-07-03 (give-up regression fix)**: On a real store (jerusalemsandals.com,
+  629 products) the adaptive limiter tested only ~28 products then the global
+  give-up latched (after a few consecutive challenges *despite* 25 passes) and
+  mass-errored the remaining 601 as blocked — worse than the pre-rework tool,
+  which at least attempted every product. Two fixes in `internal/fetch`: (1)
+  give up ONLY when blocked from the very start (`!hadSuccess`); once any
+  request succeeds, never give up — grind through all products however slowly;
+  (2) ratchet the speed *ceiling* down on each challenge (AIMD on maxLimit/
+  maxRate) so it converges on a sustainable pace instead of ramping back to a
+  rate that keeps tripping. Added a per-request challenge backstop
+  (maxReqChallenges=8) that errors one stubborn URL without a global latch.
+  Cooldown cap lowered 240s→120s. Renamed `maxChallengeStreak`→
+  `blockedFromStartStreak`. Tests updated (give-up-only-when-blocked-from-start,
+  never-give-up-after-success, ceiling-ratchet). Trade-off: a truly-blocked
+  store that nonetheless lets one product through would grind slowly — rely on
+  Ctrl-C (graceful partial report) for that; the user explicitly prefers
+  completeness over an early bail.

@@ -199,16 +199,22 @@ connection" challenges to everything for a few minutes.
 
 So `--workers` and `--rate` are **ceilings, not fixed speeds**. The tool
 starts slow, ramps up while the store stays happy, and the moment it sees a
-Cloudflare challenge it drops to a crawl and **pauses to let the limit
-clear** (you'll see a `[waiting]` message with a countdown — that's normal,
-not a freeze). It resumes automatically. If a store blocks automated access
-persistently, the tool gives up cleanly and says so in the report rather
-than grinding forever.
+Cloudflare challenge it drops to a crawl, lowers its own speed ceiling so it
+stops re-tripping, and **pauses to let the limit clear** (you'll see a
+`[waiting]` message with a countdown — that's normal, not a freeze). It
+resumes automatically and keeps going until **every** product is tested.
+
+It only bails out if a store blocks it from the very first request (no
+product ever loads — e.g. a locked store); in that case it says so in the
+report. As long as *some* products load, it will grind through the whole
+catalog rather than abandoning the rest — so a heavily rate-limited store
+just takes longer, it doesn't come back half-tested. You can Ctrl-C at any
+time to stop early and keep a partial report.
 
 Practical notes:
-- Large catalogs from one IP take a while — minutes, not seconds — and that
-  is the polite, safe speed. Raising `--rate`/`--workers` past the defaults
-  usually just trips Cloudflare sooner and ends up **slower** overall.
+- Large catalogs from one IP take a while — minutes to tens of minutes — and
+  that is the polite, safe speed. Raising `--rate`/`--workers` past the
+  defaults usually just trips Cloudflare sooner and ends up **slower**.
 - Re-run with `--mode quick` after a fix: it only re-fetches products that
   previously failed/errored, so it's far lighter on the rate limit.
 - `*.shopifypreview.com` preview/dev-store URLs are throttled much harder
